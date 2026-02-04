@@ -1,10 +1,10 @@
 # Masters-Thesis
 
 ## Huskeliste for kodesession:
-#### Før du starter: 
+### Før du starter: 
  git pull
  
-#### Når du er ferdig/pause: 
+### Når du er ferdig/pause: 
  git status
  
  git add .
