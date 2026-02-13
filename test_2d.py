@@ -75,9 +75,9 @@ def simulate_with_moving_actual_x(
     y0: float,
     A: float = 3.0,          # amplitude [m]
     f: float = 0.2,          # frekvens [Hz]
-    Ud: float = 2.0,         # (NY) "desired speed" i artikkelen
-    Delta_e: float = 5.0,    # (NY) lookahead parameter
-    gamma: float = 1.0,
+    Ud: float = 2.0,         # "desired speed"
+    Delta_e: float = 5.0,    # lookahead parameter
+    gamma: float = 10.0,
     dt: float = 0.02,
     T: float = 20.0,
     keep_on_path: bool = True
@@ -89,7 +89,7 @@ def simulate_with_moving_actual_x(
 
     Breivik & Fossen (2D) path particle:
         eps = R_p^T (p - p_p) = [s, e]
-        chi_r = atan(-e/Delta_e)
+        chi_r = atan2(-e, Delta_e)
         Up = Ud*cos(chi_r) + gamma*s
         s_p_dot = Up / ||p'(s_p)||
     """
@@ -141,13 +141,13 @@ def simulate_with_moving_actual_x(
         s_err, e_err = float(eps[0]), float(eps[1])
 
         # --- Breivik & Fossen guidance ---
-        chi_r = float(np.arctan2(-e_err, Delta_e))  # atan(-e/Delta_e)
+        chi_r = float(np.arctan2(-e_err, Delta_e))
         chi_d = float(xp + chi_r)
 
         # Path particle speed (kontrolloven)
         Up = float(Ud * np.cos(chi_r) + gamma * s_err)
 
-        # Parameteroppdatering (generell)
+        # Parameteroppdatering
         dp = path.dpos_ds(s_p)
         speed_scale = max(np.linalg.norm(dp), 1e-12)
         s_p_dot = Up / speed_scale
@@ -178,26 +178,26 @@ def simulate_with_moving_actual_x(
 if __name__ == "__main__":
     waypoints = np.array([
         [0, 0],
-        [5, 0],
-        [10, 1],
-        [15, 0],
         [20, 0],
+        [20, 5],
+        [0, 5],
+        [0, 0],
     ], dtype=float)
 
     path = ParametricPath2D(waypoints_xy=waypoints)
 
     # Start path-partikkel
-    s0 = path.L * 0.1
+    s0 = path.L * 0
 
     # Faktisk partikkel sin x-oscillasjon
-    x0, y0 = 10.0, 8.0
+    x0, y0 = 10.0, 2.0
     A = 4.0
     f = 0.15
 
     # Breivik & Fossen parametre
     Ud = 2.0
     Delta_e = 5.0
-    gamma = 1.0
+    gamma = 10.0   # <- endret til 50
 
     dt = 0.02
     T = 20.0
@@ -222,11 +222,15 @@ if __name__ == "__main__":
     p_grid = np.array([path.pos(s) for s in s_grid])
 
     # --- Figur med 4 akser (2x2)
-    fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+    fig, axs = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
     ax_xy = axs[0, 0]
     ax_s  = axs[0, 1]
     ax_e  = axs[1, 0]
     ax_u  = axs[1, 1]
+
+    # Gjør alle fire "vinduer" like store
+    for ax in axs.flat:
+        ax.set_box_aspect(1)
 
     # XY-plot
     ax_xy.plot(p_grid[:, 0], p_grid[:, 1], label="Bane x(s), y(s)")
@@ -241,17 +245,20 @@ if __name__ == "__main__":
     status_text = ax_xy.text(0.02, 0.98, "", transform=ax_xy.transAxes,
                              va="top", ha="left")
 
-    ax_xy.set_aspect("equal", adjustable="box")
     ax_xy.grid(True)
     ax_xy.legend()
     ax_xy.set_title("XY (Breivik & Fossen Up + lookahead)")
 
-    xmin, xmax = p_grid[:, 0].min(), p_grid[:, 0].max()
-    ymin, ymax = p_grid[:, 1].min(), p_grid[:, 1].max()
-    padx = 0.1 * (xmax - xmin + 1e-9)
-    pady = 0.1 * (ymax - ymin + 1e-9)
-    ax_xy.set_xlim(min(xmin, hist["ax"].min()) - padx, max(xmax, hist["ax"].max()) + padx)
-    ax_xy.set_ylim(min(ymin, hist["ay"].min()) - pady, max(ymax, hist["ay"].max()) + pady)
+    # Fast XY-visningsvindu (IKKE avhengig av path). Basert på test-signal (x0, y0, A) + margin.
+    margin_x = 10.0
+    margin_y = 10.0
+    X_MIN = x0 - abs(A) - margin_x
+    X_MAX = x0 + abs(A) + margin_x
+    Y_MIN = y0 - margin_y
+    Y_MAX = y0 + margin_y
+
+    ax_xy.set_xlim(X_MIN, X_MAX)
+    ax_xy.set_ylim(Y_MIN, Y_MAX)
 
     # --- Tidsakse for plots
     t_all = hist["t"]
@@ -299,12 +306,12 @@ if __name__ == "__main__":
         k = frames[i]
         tk = t_all[k]
 
-        # XY: path
+        # XY: path particle
         xk, yk = hist["ppx"][k], hist["ppy"][k]
         path_dot.set_data([xk], [yk])
         trail_line.set_data(hist["ppx"][:k+1], hist["ppy"][:k+1])
 
-        # XY: actual
+        # XY: actual particle
         axk, ayk = hist["ax"][k], hist["ay"][k]
         actual_dot.set_data([axk], [ayk])
         actual_trail.set_data(hist["ax"][:k+1], hist["ay"][:k+1])
@@ -331,8 +338,7 @@ if __name__ == "__main__":
 
     ani = FuncAnimation(
         fig, update, frames=len(frames),
-        init_func=init, blit=True, interval=1000*dt*stride
+        init_func=init, blit=True, interval=1000 * dt * stride
     )
 
-    plt.tight_layout()
     plt.show()
