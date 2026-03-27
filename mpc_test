@@ -1,0 +1,698 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import cvxpy as cp
+from dataclasses import dataclass
+from scipy.interpolate import CubicSpline
+from scipy.signal import cont2discrete
+
+
+# ============================================================
+# Parameter containers
+# ============================================================
+
+@dataclass
+class VehicleParams:
+    m: float
+    Iz: float
+    lf: float
+    lr: float
+    Cf: float
+    Cr: float
+
+
+@dataclass
+class SimParams:
+    dt: float
+    t_end: float
+    vx: float
+    use_rk4: bool
+
+
+@dataclass
+class MPCParams:
+    N: int
+    q_ey: float
+    q_epsi: float
+    q_vy: float
+    q_r: float
+    r_delta: float
+    r_ddelta: float
+    delta_max_deg: float
+    delta_rate_max_deg_s: float
+    use_curvature_feedforward: bool = True
+
+
+@dataclass
+class PathParams:
+    ds: float
+
+
+# ============================================================
+# Utility
+# ============================================================
+
+def wrap_angle(angle: float) -> float:
+    return (angle + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def cumulative_arclength(waypoints: np.ndarray) -> np.ndarray:
+    diffs = np.diff(waypoints, axis=0)
+    seg_lengths = np.linalg.norm(diffs, axis=1)
+    s = np.zeros(len(waypoints))
+    s[1:] = np.cumsum(seg_lengths)
+    return s
+
+
+# ============================================================
+# Path generation from waypoints using cubic splines
+# ============================================================
+
+def generate_spline_path_from_waypoints(waypoints: np.ndarray, ds: float = 0.5):
+    if waypoints.ndim != 2 or waypoints.shape[1] != 2:
+        raise ValueError("waypoints must have shape (N, 2)")
+
+    if len(waypoints) < 3:
+        raise ValueError("Need at least 3 waypoints for cubic spline interpolation.")
+
+    s_wp = cumulative_arclength(waypoints)
+    total_length = s_wp[-1]
+
+    cs_x = CubicSpline(s_wp, waypoints[:, 0], bc_type="natural")
+    cs_y = CubicSpline(s_wp, waypoints[:, 1], bc_type="natural")
+
+    s_path = np.arange(0.0, total_length + ds, ds)
+
+    x_path = cs_x(s_path)
+    y_path = cs_y(s_path)
+
+    dx_ds = cs_x(s_path, 1)
+    dy_ds = cs_y(s_path, 1)
+    ddx_ds2 = cs_x(s_path, 2)
+    ddy_ds2 = cs_y(s_path, 2)
+
+    psi_path = np.arctan2(dy_ds, dx_ds)
+
+    denom = (dx_ds**2 + dy_ds**2) ** 1.5
+    denom = np.maximum(denom, 1e-9)
+
+    kappa_path = (dx_ds * ddy_ds2 - dy_ds * ddx_ds2) / denom
+
+    return {
+        "x": x_path,
+        "y": y_path,
+        "psi": psi_path,
+        "kappa": kappa_path,
+        "s": s_path,
+        "length": total_length
+    }
+
+
+# ============================================================
+# Closest-point and path error logic
+# ============================================================
+
+def find_closest_path_index(Xg: float, Yg: float, path: dict, last_idx: int, window_back: int = 10, window_forward: int = 120):
+    n = len(path["x"])
+    i0 = max(0, last_idx - window_back)
+    i1 = min(n, last_idx + window_forward)
+
+    dx = path["x"][i0:i1] - Xg
+    dy = path["y"][i0:i1] - Yg
+    dist2 = dx**2 + dy**2
+
+    idx_local = np.argmin(dist2)
+    return i0 + idx_local
+
+
+def compute_path_errors(Xg: float, Yg: float, psi_g: float, path: dict, idx: int):
+    xr = path["x"][idx]
+    yr = path["y"][idx]
+    psi_r = path["psi"][idx]
+
+    dx = Xg - xr
+    dy = Yg - yr
+
+    nx = -np.sin(psi_r)
+    ny =  np.cos(psi_r)
+
+    ey = dx * nx + dy * ny
+    epsi = wrap_angle(psi_g - psi_r)
+
+    return ey, epsi
+
+
+def build_curvature_preview(path: dict, closest_idx: int, horizon: int, step_distance: float):
+    preview = np.zeros(horizon)
+    ds_path = path["s"][1] - path["s"][0]
+
+    for k in range(horizon):
+        idx = closest_idx + int(round((k * step_distance) / ds_path))
+        idx = min(idx, len(path["kappa"]) - 1)
+        preview[k] = path["kappa"][idx]
+
+    return preview
+
+
+# ============================================================
+# Tire model
+# ============================================================
+
+def slip_angles(vy: float, r: float, delta: float, vx: float, p: VehicleParams):
+    vx_safe = max(vx, 0.5)
+    alpha_f = (vy + p.lf * r) / vx_safe - delta
+    alpha_r = (vy - p.lr * r) / vx_safe
+    return alpha_f, alpha_r
+
+
+def tire_forces_linear(vy: float, r: float, delta: float, vx: float, p: VehicleParams):
+    alpha_f, alpha_r = slip_angles(vy, r, delta, vx, p)
+    Fyf = -p.Cf * alpha_f
+    Fyr = -p.Cr * alpha_r
+    return Fyf, Fyr, alpha_f, alpha_r
+
+
+# ============================================================
+# Nonlinear plant model
+# ============================================================
+
+def continuous_dynamics_error_model(x: np.ndarray, delta: float, kappa: float, vx: float, p: VehicleParams):
+    """
+    Error-state dynamic bicycle model:
+        x = [e_y, e_psi, v_y, r]
+    """
+    ey, epsi, vy, r = x
+
+    Fyf, Fyr, alpha_f, alpha_r = tire_forces_linear(vy, r, delta, vx, p)
+
+    ey_dot = vy + vx * epsi
+    epsi_dot = r - vx * kappa
+    vy_dot = (Fyf + Fyr) / p.m - vx * r
+    r_dot = (p.lf * Fyf - p.lr * Fyr) / p.Iz
+
+    x_dot = np.array([ey_dot, epsi_dot, vy_dot, r_dot], dtype=float)
+
+    debug = {
+        "Fyf": Fyf,
+        "Fyr": Fyr,
+        "alpha_f": alpha_f,
+        "alpha_r": alpha_r
+    }
+    return x_dot, debug
+
+
+def euler_step_error_model(x: np.ndarray, delta: float, kappa: float, vx: float, p: VehicleParams, dt: float):
+    x_dot, debug = continuous_dynamics_error_model(x, delta, kappa, vx, p)
+    return x + dt * x_dot, debug
+
+
+def rk4_step_error_model(x: np.ndarray, delta: float, kappa: float, vx: float, p: VehicleParams, dt: float):
+    k1, _ = continuous_dynamics_error_model(x, delta, kappa, vx, p)
+    k2, _ = continuous_dynamics_error_model(x + 0.5 * dt * k1, delta, kappa, vx, p)
+    k3, _ = continuous_dynamics_error_model(x + 0.5 * dt * k2, delta, kappa, vx, p)
+    k4, debug = continuous_dynamics_error_model(x + dt * k3, delta, kappa, vx, p)
+    x_next = x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+    return x_next, debug
+
+
+# ============================================================
+# Linearized model for MPC
+# ============================================================
+
+def linear_state_space_matrices(vx: float, p: VehicleParams):
+    vx_safe = max(vx, 0.5)
+
+    A = np.array([
+        [0.0, vx_safe, 1.0, 0.0],
+        [0.0, 0.0,     0.0, 1.0],
+        [0.0, 0.0,
+         -(p.Cf + p.Cr) / (p.m * vx_safe),
+         -((p.Cf * p.lf - p.Cr * p.lr) / (p.m * vx_safe) + vx_safe)],
+        [0.0, 0.0,
+         -(p.Cf * p.lf - p.Cr * p.lr) / (p.Iz * vx_safe),
+         -(p.Cf * p.lf**2 + p.Cr * p.lr**2) / (p.Iz * vx_safe)]
+    ], dtype=float)
+
+    B = np.array([
+        [0.0],
+        [0.0],
+        [p.Cf / p.m],
+        [p.Cf * p.lf / p.Iz]
+    ], dtype=float)
+
+    E = np.array([
+        [0.0],
+        [-vx_safe],
+        [0.0],
+        [0.0]
+    ], dtype=float)
+
+    return A, B, E
+
+
+def discretize_zoh(A: np.ndarray, B: np.ndarray, E: np.ndarray, dt: float):
+    B_aug = np.hstack([B, E])  # inputs: [delta, kappa]
+    C = np.eye(A.shape[0])
+    D = np.zeros((A.shape[0], B_aug.shape[1]))
+
+    Ad, B_aug_d, _, _, _ = cont2discrete((A, B_aug, C, D), dt, method="zoh")
+    Bd = B_aug_d[:, [0]]
+    Ed = B_aug_d[:, [1]]
+    return Ad, Bd, Ed
+
+
+# ============================================================
+# Feedforward steering from curvature
+# ============================================================
+
+def curvature_feedforward(kappa: float, p: VehicleParams) -> float:
+    """
+    Enkel kinematisk feedforward:
+        delta_ff ~ (lf + lr) * kappa
+    """
+    return (p.lf + p.lr) * kappa
+
+
+# ============================================================
+# MPC solver
+# ============================================================
+
+def solve_mpc(
+    x0: np.ndarray,
+    delta_prev: float,
+    kappa_preview: np.ndarray,
+    Ad: np.ndarray,
+    Bd: np.ndarray,
+    Ed: np.ndarray,
+    mpc: MPCParams,
+    dt: float,
+    vehicle: VehicleParams
+):
+    nx = Ad.shape[0]
+    nu = Bd.shape[1]
+    N = mpc.N
+
+    Q = np.diag([mpc.q_ey, mpc.q_epsi, mpc.q_vy, mpc.q_r])
+    Qf = Q.copy()
+    R = np.array([[mpc.r_delta]])
+    Rd = np.array([[mpc.r_ddelta]])
+
+    delta_max = np.deg2rad(mpc.delta_max_deg)
+    delta_rate_max = np.deg2rad(mpc.delta_rate_max_deg_s)
+    delta_step_max = delta_rate_max * dt
+
+    x = cp.Variable((nx, N + 1))
+    u = cp.Variable((nu, N))
+
+    cost = 0
+    constraints = [x[:, 0] == x0]
+
+    for k in range(N):
+        kappa_k = float(kappa_preview[k])
+
+        if mpc.use_curvature_feedforward:
+            delta_ff = curvature_feedforward(kappa_k, vehicle)
+        else:
+            delta_ff = 0.0
+
+        constraints += [
+            x[:, k + 1] == Ad @ x[:, k] + Bd @ u[:, k] + Ed.flatten() * kappa_k
+        ]
+
+        constraints += [
+            u[:, k] <= delta_max,
+            u[:, k] >= -delta_max
+        ]
+
+        cost += cp.quad_form(x[:, k], Q)
+        cost += mpc.r_delta * cp.sum_squares(u[:, k] - delta_ff)
+
+        if k == 0:
+            du = u[:, k] - delta_prev
+        else:
+            du = u[:, k] - u[:, k - 1]
+
+        cost += cp.quad_form(du, Rd)
+
+        constraints += [
+            du <= delta_step_max,
+            du >= -delta_step_max
+        ]
+
+    cost += cp.quad_form(x[:, N], Qf)
+
+    problem = cp.Problem(cp.Minimize(cost), constraints)
+    problem.solve(
+        solver=cp.OSQP,
+        warm_start=True,
+        verbose=False,
+        max_iter=50000,
+        eps_abs=1e-5,
+        eps_rel=1e-5
+    )
+
+    if problem.status not in ["optimal", "optimal_inaccurate"]:
+        raise RuntimeError(f"MPC solve failed. Status: {problem.status}")
+
+    u_opt = np.array(u.value).reshape(nu, N)
+    x_opt = np.array(x.value)
+
+    return float(u_opt[0, 0]), u_opt, x_opt
+
+
+# ============================================================
+# Closed-loop simulation
+# ============================================================
+
+def simulate_closed_loop(vehicle: VehicleParams, sim: SimParams, mpc: MPCParams, path: dict):
+    A, B, E = linear_state_space_matrices(sim.vx, vehicle)
+    Ad, Bd, Ed = discretize_zoh(A, B, E, sim.dt)
+
+    n_steps = int(sim.t_end / sim.dt) + 1
+    time = np.linspace(0.0, sim.t_end, n_steps)
+
+    Xg, Yg, psi_g = path["x"][0], path["y"][0], path["psi"][0]
+    vy, r = 0.0, 0.0
+    delta_prev = 0.0
+    closest_idx = 0
+
+    X_state = np.zeros((n_steps, 4))
+    delta_log = np.zeros(n_steps)
+    delta_ff_log = np.zeros(n_steps)
+    kappa_log = np.zeros(n_steps)
+    Fyf_log = np.zeros(n_steps)
+    Fyr_log = np.zeros(n_steps)
+    af_log = np.zeros(n_steps)
+    ar_log = np.zeros(n_steps)
+
+    Xg_log = np.zeros(n_steps)
+    Yg_log = np.zeros(n_steps)
+    psi_g_log = np.zeros(n_steps)
+
+    Xclosest_log = np.zeros(n_steps)
+    Yclosest_log = np.zeros(n_steps)
+    idx_log = np.zeros(n_steps, dtype=int)
+
+    step_distance = sim.vx * sim.dt
+
+    for i, _ in enumerate(time):
+        closest_idx = find_closest_path_index(Xg, Yg, path, last_idx=closest_idx)
+
+        ey, epsi = compute_path_errors(Xg, Yg, psi_g, path, closest_idx)
+        x_mpc = np.array([ey, epsi, vy, r], dtype=float)
+
+        kappa_preview = build_curvature_preview(
+            path=path,
+            closest_idx=closest_idx,
+            horizon=mpc.N,
+            step_distance=step_distance
+        )
+
+        delta_cmd, _, _ = solve_mpc(
+            x0=x_mpc,
+            delta_prev=delta_prev,
+            kappa_preview=kappa_preview,
+            Ad=Ad,
+            Bd=Bd,
+            Ed=Ed,
+            mpc=mpc,
+            dt=sim.dt,
+            vehicle=vehicle
+        )
+
+        kappa_now = path["kappa"][closest_idx]
+        delta_ff_now = curvature_feedforward(kappa_now, vehicle) if mpc.use_curvature_feedforward else 0.0
+
+        x_dyn = np.array([ey, epsi, vy, r], dtype=float)
+        if sim.use_rk4:
+            x_next, debug = rk4_step_error_model(
+                x_dyn, delta_cmd, kappa_now, sim.vx, vehicle, sim.dt
+            )
+        else:
+            x_next, debug = euler_step_error_model(
+                x_dyn, delta_cmd, kappa_now, sim.vx, vehicle, sim.dt
+            )
+
+        vy = x_next[2]
+        r = x_next[3]
+
+        Xg_dot = sim.vx * np.cos(psi_g) - vy * np.sin(psi_g)
+        Yg_dot = sim.vx * np.sin(psi_g) + vy * np.cos(psi_g)
+        psi_g_dot = r
+
+        Xg += sim.dt * Xg_dot
+        Yg += sim.dt * Yg_dot
+        psi_g = wrap_angle(psi_g + sim.dt * psi_g_dot)
+
+        delta_prev = delta_cmd
+
+        X_state[i, :] = np.array([ey, epsi, vy, r])
+        delta_log[i] = delta_cmd
+        delta_ff_log[i] = delta_ff_now
+        kappa_log[i] = kappa_now
+        Fyf_log[i] = debug["Fyf"]
+        Fyr_log[i] = debug["Fyr"]
+        af_log[i] = debug["alpha_f"]
+        ar_log[i] = debug["alpha_r"]
+
+        Xg_log[i] = Xg
+        Yg_log[i] = Yg
+        psi_g_log[i] = psi_g
+
+        Xclosest_log[i] = path["x"][closest_idx]
+        Yclosest_log[i] = path["y"][closest_idx]
+        idx_log[i] = closest_idx
+
+        if closest_idx >= len(path["x"]) - 2:
+            X_state = X_state[:i+1]
+            delta_log = delta_log[:i+1]
+            delta_ff_log = delta_ff_log[:i+1]
+            kappa_log = kappa_log[:i+1]
+            Fyf_log = Fyf_log[:i+1]
+            Fyr_log = Fyr_log[:i+1]
+            af_log = af_log[:i+1]
+            ar_log = ar_log[:i+1]
+            Xg_log = Xg_log[:i+1]
+            Yg_log = Yg_log[:i+1]
+            psi_g_log = psi_g_log[:i+1]
+            Xclosest_log = Xclosest_log[:i+1]
+            Yclosest_log = Yclosest_log[:i+1]
+            idx_log = idx_log[:i+1]
+            time = time[:i+1]
+            break
+
+    return {
+        "time": time,
+        "state": X_state,
+        "delta": delta_log,
+        "delta_ff": delta_ff_log,
+        "kappa": kappa_log,
+        "Fyf": Fyf_log,
+        "Fyr": Fyr_log,
+        "alpha_f": af_log,
+        "alpha_r": ar_log,
+        "Ad": Ad,
+        "Bd": Bd,
+        "Ed": Ed,
+        "X_global": Xg_log,
+        "Y_global": Yg_log,
+        "psi_global": psi_g_log,
+        "X_ref": path["x"],
+        "Y_ref": path["y"],
+        "psi_ref": path["psi"],
+        "kappa_ref": path["kappa"],
+        "s_ref": path["s"],
+        "X_closest": Xclosest_log,
+        "Y_closest": Yclosest_log,
+        "closest_idx": idx_log
+    }
+
+
+# ============================================================
+# Plotting
+# ============================================================
+
+def plot_path(results, waypoints=None):
+    plt.figure(figsize=(10, 6))
+    plt.plot(results["X_ref"], results["Y_ref"], "--", linewidth=2, label="Spline path")
+    plt.plot(results["X_global"], results["Y_global"], linewidth=2, label="Vehicle path")
+    plt.plot(results["X_closest"], results["Y_closest"], ":", linewidth=1.2, label="Closest path points")
+
+    if waypoints is not None:
+        plt.plot(waypoints[:, 0], waypoints[:, 1], "o", label="Waypoints")
+
+    plt.xlabel("X [m]")
+    plt.ylabel("Y [m]")
+    plt.title("Desired spline path vs vehicle trajectory")
+    plt.axis("equal")
+    plt.grid(True)
+    plt.legend()
+
+
+def plot_reference_path_properties(path):
+    plt.figure(figsize=(10, 6))
+    plt.subplot(2, 1, 1)
+    plt.plot(path["s"], np.rad2deg(path["psi"]))
+    plt.ylabel("Path heading [deg]")
+    plt.title("Reference path properties")
+    plt.grid(True)
+
+    plt.subplot(2, 1, 2)
+    plt.plot(path["s"], path["kappa"])
+    plt.xlabel("Arc length s [m]")
+    plt.ylabel("Curvature [1/m]")
+    plt.grid(True)
+
+    plt.tight_layout()
+
+
+def plot_signals(results, title_prefix="Dynamic bicycle MPC"):
+    t = results["time"]
+    X = results["state"]
+
+    ey = X[:, 0]
+    epsi = X[:, 1]
+    vy = X[:, 2]
+    r = X[:, 3]
+
+    plt.figure(figsize=(10, 8))
+    plt.subplot(2, 1, 1)
+    plt.plot(t, ey)
+    plt.ylabel(r"$e_y$ [m]")
+    plt.title(f"{title_prefix} - Tracking errors")
+    plt.grid(True)
+
+    plt.subplot(2, 1, 2)
+    plt.plot(t, np.rad2deg(epsi))
+    plt.xlabel("Time [s]")
+    plt.ylabel(r"$e_\psi$ [deg]")
+    plt.grid(True)
+    plt.tight_layout()
+
+    plt.figure(figsize=(10, 8))
+    plt.subplot(2, 1, 1)
+    plt.plot(t, vy)
+    plt.ylabel(r"$v_y$ [m/s]")
+    plt.title(f"{title_prefix} - Vehicle lateral states")
+    plt.grid(True)
+
+    plt.subplot(2, 1, 2)
+    plt.plot(t, np.rad2deg(r))
+    plt.xlabel("Time [s]")
+    plt.ylabel(r"$r$ [deg/s]")
+    plt.grid(True)
+    plt.tight_layout()
+
+    plt.figure(figsize=(10, 8))
+    plt.subplot(2, 1, 1)
+    plt.plot(t, np.rad2deg(results["delta"]), label="delta")
+    plt.plot(t, np.rad2deg(results["delta_ff"]), "--", label="delta_ff")
+    plt.ylabel("Steering [deg]")
+    plt.title(f"{title_prefix} - Steering")
+    plt.grid(True)
+    plt.legend()
+
+    plt.subplot(2, 1, 2)
+    delta_rate = np.diff(results["delta"]) / np.diff(t) if len(t) > 1 else np.array([0.0])
+    t_rate = t[1:] if len(t) > 1 else t
+    plt.plot(t_rate, np.rad2deg(delta_rate))
+    plt.xlabel("Time [s]")
+    plt.ylabel(r"$\dot{\delta}$ [deg/s]")
+    plt.grid(True)
+    plt.tight_layout()
+
+    plt.figure(figsize=(10, 8))
+    plt.subplot(2, 1, 1)
+    plt.plot(t, np.rad2deg(results["alpha_f"]), label=r"$\alpha_f$")
+    plt.plot(t, np.rad2deg(results["alpha_r"]), label=r"$\alpha_r$")
+    plt.ylabel("Slip angles [deg]")
+    plt.title(f"{title_prefix} - Tire slip angles")
+    plt.grid(True)
+    plt.legend()
+
+    plt.subplot(2, 1, 2)
+    plt.plot(t, results["Fyf"], label=r"$F_{yf}$")
+    plt.plot(t, results["Fyr"], label=r"$F_{yr}$")
+    plt.xlabel("Time [s]")
+    plt.ylabel("Lateral force [N]")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(t, results["kappa"])
+    plt.xlabel("Time [s]")
+    plt.ylabel(r"$\kappa$ [1/m]")
+    plt.title(f"{title_prefix} - Experienced path curvature")
+    plt.grid(True)
+    plt.tight_layout()
+
+
+# ============================================================
+# Main
+# ============================================================
+
+if __name__ == "__main__":
+    vehicle = VehicleParams(
+        m=1757.0,
+        Iz=3100.0,
+        lf=1.23,
+        lr=1.49,
+        Cf=125000.0,
+        Cr=118000.0
+    )
+
+    sim = SimParams(
+        dt=0.03,
+        t_end=13.0,
+        vx=3.0,
+        use_rk4=True
+    )
+
+    mpc = MPCParams(
+        N=50,
+        q_ey=500.0,
+        q_epsi=120.0,
+        q_vy=5.0,
+        q_r=5.0,
+        r_delta=1.0,
+        r_ddelta=1.0,
+        delta_max_deg=35.0,
+        delta_rate_max_deg_s=120.0,
+        use_curvature_feedforward=True
+    )
+
+    path_params = PathParams(
+        ds=0.25
+    )
+
+    waypoints = np.array([
+        [0.0,  0.0],
+        [2.5,  0.0],
+        [5.0,  0.0],
+        [7.5,  0.0],
+        [10.0, 0.0],
+        [10.0, 2.5],
+        [10.0, 5.0],
+        [10.0, 7.5],
+        [10.0, 10.0]
+    ])
+
+    path = generate_spline_path_from_waypoints(waypoints, ds=path_params.ds)
+
+    print("Generated spline path with length:", path["s"][-1])
+    print("Max curvature:", np.max(np.abs(path["kappa"])))
+
+    results = simulate_closed_loop(vehicle, sim, mpc, path)
+
+    np.set_printoptions(precision=4, suppress=True)
+    print("Discrete-time Ad:")
+    print(results["Ad"])
+    print("\nDiscrete-time Bd:")
+    print(results["Bd"])
+    print("\nDiscrete-time Ed:")
+    print(results["Ed"])
+
+    plot_reference_path_properties(path)
+    plot_path(results, waypoints=waypoints)
+    plot_signals(results)
+    plt.show()
