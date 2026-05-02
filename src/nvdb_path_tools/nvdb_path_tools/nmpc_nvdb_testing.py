@@ -3,6 +3,9 @@ import requests
 import numpy as np
 import casadi as ca
 import matplotlib.pyplot as plt
+import csv
+import os
+import traceback
 from shapely import wkt
 from scipy.interpolate import CubicSpline
 from dataclasses import dataclass
@@ -899,6 +902,8 @@ def compute_metrics(
     valid_solve = solve_time_log[~np.isnan(solve_time_log)]
     valid_iters = iter_log[~np.isnan(iter_log)]
 
+    # Same CNXTE definition as in the project thesis:
+    # pointwise CNXTE = |cross-track error| * |curvature|
     cnxte_signal = abs_ey * abs_kappa
 
     metrics = {
@@ -919,7 +924,11 @@ def compute_metrics(
         "iadc_rad": safe_trapezoid(abs_ddelta, t_log),
         "iadc_deg": np.rad2deg(safe_trapezoid(abs_ddelta, t_log)),
 
-        "cnxte": safe_trapezoid(cnxte_signal, t_log),
+        # CNXTE exactly as in the project thesis: mean, 95th percentile and max
+        "mean_cnxte": safe_nanmean(cnxte_signal),
+        "p95_cnxte": safe_nanpercentile(cnxte_signal, 95),
+        "max_cnxte": safe_nanmax(cnxte_signal),
+
         "mean_abs_kappa": safe_nanmean(abs_kappa),
         "max_abs_kappa": safe_nanmax(abs_kappa),
 
@@ -965,7 +974,9 @@ def print_metrics_table(metrics):
     print(f"  IADC:                     {metrics['iadc_deg']:10.4f} deg")
 
     print("\nCurvature-aware metrics")
-    print(f"  CNXTE:                    {metrics['cnxte']:10.6f}")
+    print(f"  Mean CNXTE:               {metrics['mean_cnxte']:10.6f}")
+    print(f"  95% CNXTE:                {metrics['p95_cnxte']:10.6f}")
+    print(f"  Max CNXTE:                {metrics['max_cnxte']:10.6f}")
     print(f"  Mean |kappa|:             {metrics['mean_abs_kappa']:10.6f} 1/m")
     print(f"  Max |kappa|:              {metrics['max_abs_kappa']:10.6f} 1/m")
 
@@ -985,7 +996,6 @@ def print_metrics_table(metrics):
     print(f"  Hard solver failures:     {metrics['hard_failures']:10d}")
     print(f"  Soft solver warnings:     {metrics['soft_warnings']:10d}")
 
-
 def print_csv_and_latex_rows(metrics):
     headers = [
         "RMS ey [m]",
@@ -997,7 +1007,9 @@ def print_csv_and_latex_rows(metrics):
         "Max |delta| [deg]",
         "Max |ddelta| [deg/s]",
         "IADC [rad]",
-        "CNXTE",
+        "Mean CNXTE",
+        "P95 CNXTE",
+        "Max CNXTE",
         "Avg solve [ms]",
         "Max solve [ms]",
         "Hard fails",
@@ -1014,7 +1026,9 @@ def print_csv_and_latex_rows(metrics):
         f"{metrics['max_abs_delta_deg']:.2f}",
         f"{metrics['max_abs_ddelta_deg_s']:.2f}",
         f"{metrics['iadc_rad']:.4f}",
-        f"{metrics['cnxte']:.6f}",
+        f"{metrics['mean_cnxte']:.6f}",
+        f"{metrics['p95_cnxte']:.6f}",
+        f"{metrics['max_cnxte']:.6f}",
         f"{metrics['avg_solve_ms']:.2f}",
         f"{metrics['max_solve_ms']:.2f}",
         str(metrics["hard_failures"]),
@@ -1034,19 +1048,23 @@ def print_csv_and_latex_rows(metrics):
     print("\n" + "=" * 80)
     print("LATEX TABLE ROW")
     print("=" * 80)
+
     latex_values = [
-        values[0],
-        values[1],
-        values[2],
-        values[4],
-        values[5],
-        values[7],
-        values[8],
-        values[9],
-        values[10],
-        values[11],
-        values[13],
+        f"{metrics['rms_ey_m']:.4f}",
+        f"{metrics['max_abs_ey_m']:.4f}",
+        f"{metrics['p95_abs_ey_m']:.4f}",
+        f"{metrics['rms_epsi_deg']:.3f}",
+        f"{metrics['iae_epsi_rad_s']:.4f}",
+        f"{metrics['max_abs_ddelta_deg_s']:.2f}",
+        f"{metrics['iadc_rad']:.4f}",
+        f"{metrics['mean_cnxte']:.6f}",
+        f"{metrics['p95_cnxte']:.6f}",
+        f"{metrics['max_cnxte']:.6f}",
+        f"{metrics['avg_solve_ms']:.2f}",
+        f"{metrics['max_solve_ms']:.2f}",
+        str(metrics["soft_warnings"]),
     ]
+
     print(" & ".join(latex_values) + r" \\")
 
 
@@ -1068,95 +1086,271 @@ def compute_pacejka_report_values(veh: VehicleParams, model_par: ModelParams):
 
 
 # ============================================================
-# Main
+# Experiment runner
 # ============================================================
 
-def main():
+@dataclass
+class ExperimentConfig:
+    name: str
+    group: str
 
-    # --------------------------------------------------------
-    # Experiment setup
-    # --------------------------------------------------------
+    path_type: str = "nvdb"
+    synthetic_path: str = ""
 
-    vegsystemreferanse = "KV1253"
-    kommune = "3201"
+    vegsystemreferanse: str = "KV1253"
+    kommune: str = "3201"
 
-    tire_model_ctrl = "linear"       # "linear" or "dugoff"
-    tire_model_plant = "pacejka"     # "linear", "dugoff", or "pacejka"
+    tire_model_ctrl: str = "dugoff"
+    tire_model_plant: str = "pacejka"
 
-    stiffness_scale_ctrl = 1.00
-    stiffness_scale_plant = 1.00
+    stiffness_scale_ctrl: float = 1.0
+    stiffness_scale_plant: float = 1.0
 
-    mu_ctrl = 0.80
-    mu_plant = 0.80
+    mu_ctrl: float = 0.8
+    mu_plant: float = 0.8
 
-    use_longitudinal_acc_profile = False
+    vx_nominal: float = 7.0
+    vx_min: float = 3.0
+    vx_max: float = 10.0
+    ay_max: float = 1.5
 
-    ctrl_par = ControllerParams()
-    sim_par = SimulationParams()
-    speed_par = SpeedProfileParams()
+    N: int = 18
+    dt: float = 0.1
+    sim_time: float = 80.0
 
-    model_ctrl = ModelParams(tire_model=tire_model_ctrl)
-    model_plant = ModelParams(tire_model=tire_model_plant)
+    use_longitudinal_acc_profile: bool = False
+    max_points: int = 300
+
+
+def create_synthetic_waypoints(path_name):
+    if path_name == "straight":
+        x = np.linspace(0.0, 120.0, 13)
+        y = np.zeros_like(x)
+        return x, y
+
+    if path_name == "mild":
+        x = np.array([0, 15, 30, 45, 60, 75, 90, 105, 120], dtype=float)
+        y = np.array([0, 0, 3, 8, 10, 8, 3, 0, 0], dtype=float)
+        return x, y
+
+    if path_name == "sharp":
+        x = np.array([0, 10, 20, 30, 40, 50, 60, 70, 85, 100], dtype=float)
+        y = np.array([0, 0, 2, 12, 28, 38, 35, 25, 18, 18], dtype=float)
+        return x, y
+
+    if path_name == "s_curve":
+        x = np.array([0, 15, 30, 45, 60, 75, 90, 105, 120], dtype=float)
+        y = np.array([0, 0, 8, 15, 8, 0, -8, -15, -8], dtype=float)
+        return x, y
+
+    if path_name == "constant_radius":
+        R = 35.0
+        theta = np.linspace(0.0, np.pi / 2.0, 20)
+        x = R * np.sin(theta)
+        y = R * (1.0 - np.cos(theta))
+        return x, y
+
+    raise ValueError(f"Unknown synthetic path: {path_name}")
+
+
+def build_experiment_list():
+    experiments = []
+
+    for path_name in ["straight", "constant_radius", "mild"]:
+        experiments.append(ExperimentConfig(
+            name=f"verification_{path_name}_dugoff_dugoff_v7_mu08",
+            group="verification",
+            path_type="synthetic",
+            synthetic_path=path_name,
+            tire_model_ctrl="dugoff",
+            tire_model_plant="dugoff",
+            vx_nominal=7.0,
+            mu_ctrl=0.8,
+            mu_plant=0.8,
+            N=18,
+        ))
+
+    for path_name in ["mild", "sharp", "s_curve"]:
+        experiments.append(ExperimentConfig(
+            name=f"geometry_{path_name}_dugoff_pacejka_v7_mu08",
+            group="geometry",
+            path_type="synthetic",
+            synthetic_path=path_name,
+            tire_model_ctrl="dugoff",
+            tire_model_plant="pacejka",
+            vx_nominal=7.0,
+            mu_ctrl=0.8,
+            mu_plant=0.8,
+            N=18,
+        ))
+
+    for road in ["KV1253", "KV1167"]:
+        experiments.append(ExperimentConfig(
+            name=f"geometry_{road}_dugoff_pacejka_v7_mu08",
+            group="geometry",
+            path_type="nvdb",
+            vegsystemreferanse=road,
+            kommune="3201",
+            tire_model_ctrl="dugoff",
+            tire_model_plant="pacejka",
+            vx_nominal=7.0,
+            mu_ctrl=0.8,
+            mu_plant=0.8,
+            N=18,
+        ))
+
+    tire_tests = [
+        ("linear", "linear"),
+        ("dugoff", "dugoff"),
+        ("linear", "pacejka"),
+        ("dugoff", "pacejka"),
+    ]
+
+    for ctrl_model, plant_model in tire_tests:
+        experiments.append(ExperimentConfig(
+            name=f"tiremodel_KV1167_{ctrl_model}_{plant_model}_v7_mu08",
+            group="tire_model",
+            path_type="nvdb",
+            vegsystemreferanse="KV1167",
+            kommune="3201",
+            tire_model_ctrl=ctrl_model,
+            tire_model_plant=plant_model,
+            vx_nominal=7.0,
+            mu_ctrl=0.8,
+            mu_plant=0.8,
+            N=18,
+        ))
+
+    for vx in [4.0, 6.0, 8.0, 10.0]:
+        experiments.append(ExperimentConfig(
+            name=f"speed_KV1167_dugoff_pacejka_v{vx:.0f}_mu08",
+            group="speed",
+            path_type="nvdb",
+            vegsystemreferanse="KV1167",
+            kommune="3201",
+            tire_model_ctrl="dugoff",
+            tire_model_plant="pacejka",
+            vx_nominal=vx,
+            vx_min=3.0,
+            vx_max=max(10.0, vx),
+            mu_ctrl=0.8,
+            mu_plant=0.8,
+            N=18,
+        ))
+
+    for mu_plant in [0.8, 0.6, 0.4, 0.3]:
+        experiments.append(ExperimentConfig(
+            name=f"friction_KV1167_dugoff_pacejka_v7_muplant{mu_plant:.1f}",
+            group="friction",
+            path_type="nvdb",
+            vegsystemreferanse="KV1167",
+            kommune="3201",
+            tire_model_ctrl="dugoff",
+            tire_model_plant="pacejka",
+            vx_nominal=7.0,
+            mu_ctrl=0.8,
+            mu_plant=mu_plant,
+            N=18,
+        ))
+
+    for scale in [0.7, 1.0, 1.3]:
+        experiments.append(ExperimentConfig(
+            name=f"stiffness_KV1167_dugoff_pacejka_v7_scaleplant{scale:.1f}",
+            group="stiffness",
+            path_type="nvdb",
+            vegsystemreferanse="KV1167",
+            kommune="3201",
+            tire_model_ctrl="dugoff",
+            tire_model_plant="pacejka",
+            stiffness_scale_ctrl=1.0,
+            stiffness_scale_plant=scale,
+            vx_nominal=7.0,
+            mu_ctrl=0.8,
+            mu_plant=0.8,
+            N=18,
+        ))
+
+    for N in [12, 18, 25]:
+        experiments.append(ExperimentConfig(
+            name=f"solver_KV1167_dugoff_pacejka_N{N}",
+            group="solver",
+            path_type="nvdb",
+            vegsystemreferanse="KV1167",
+            kommune="3201",
+            tire_model_ctrl="dugoff",
+            tire_model_plant="pacejka",
+            vx_nominal=7.0,
+            mu_ctrl=0.8,
+            mu_plant=0.8,
+            N=N,
+        ))
+
+    return experiments
+
+
+def build_path_for_experiment(cfg, path_cache):
+    if cfg.path_type == "synthetic":
+        x_wp, y_wp = create_synthetic_waypoints(cfg.synthetic_path)
+        return x_wp, y_wp, f"SYNTHETIC_{cfg.synthetic_path}"
+
+    if cfg.path_type == "nvdb":
+        cache_key = (cfg.vegsystemreferanse, cfg.kommune, cfg.max_points)
+
+        if cache_key not in path_cache:
+            path_cache[cache_key] = fetch_nvdb_waypoints(
+                vegsystemreferanse=cfg.vegsystemreferanse,
+                kommune=cfg.kommune,
+                max_points=cfg.max_points,
+            )
+
+        x_wp, y_wp = path_cache[cache_key]
+        return x_wp, y_wp, f"NVDB_{cfg.vegsystemreferanse}"
+
+    raise ValueError(f"Unknown path_type: {cfg.path_type}")
+
+
+def run_experiment(cfg, path_cache):
+    ctrl_par = ControllerParams(N=cfg.N, dt=cfg.dt)
+    sim_par = SimulationParams(dt=cfg.dt, sim_time=cfg.sim_time)
+
+    speed_par = SpeedProfileParams(
+        vx_nominal=cfg.vx_nominal,
+        vx_min=cfg.vx_min,
+        vx_max=cfg.vx_max,
+        ay_max=cfg.ay_max,
+    )
+
+    model_ctrl = ModelParams(tire_model=cfg.tire_model_ctrl)
+    model_plant = ModelParams(tire_model=cfg.tire_model_plant)
 
     veh_ctrl = VehicleParams(
-        m=1757.0,
-        Iz=3100.0,
-        lf=1.23,
-        lr=1.49,
-        Cf=125000.0 * stiffness_scale_ctrl,
-        Cr=118000.0 * stiffness_scale_ctrl,
-        mu=mu_ctrl
+        Cf=125000.0 * cfg.stiffness_scale_ctrl,
+        Cr=118000.0 * cfg.stiffness_scale_ctrl,
+        mu=cfg.mu_ctrl,
     )
 
     veh_plant = VehicleParams(
-        m=1757.0,
-        Iz=3100.0,
-        lf=1.23,
-        lr=1.49,
-        Cf=125000.0 * stiffness_scale_plant,
-        Cr=118000.0 * stiffness_scale_plant,
-        mu=mu_plant
+        Cf=125000.0 * cfg.stiffness_scale_plant,
+        Cr=118000.0 * cfg.stiffness_scale_plant,
+        mu=cfg.mu_plant,
     )
 
-    # --------------------------------------------------------
-    # Build NVDB path
-    # --------------------------------------------------------
-
-    path_name = f"NVDB_{vegsystemreferanse}"
-
-    print("\nFetching NVDB path...")
-    x_wp, y_wp = fetch_nvdb_waypoints(
-        vegsystemreferanse=vegsystemreferanse,
-        kommune=kommune,
-        max_points=300,
-    )
+    x_wp, y_wp, path_name = build_path_for_experiment(cfg, path_cache)
 
     path = SplinePath(x_wp, y_wp, ds=0.5)
-
     speed_profile = build_curvature_aware_speed_profile(path, speed_par)
 
-    if use_longitudinal_acc_profile:
+    if cfg.use_longitudinal_acc_profile:
         ax_profile = build_longitudinal_acc_profile(path, speed_profile)
     else:
         ax_profile = np.zeros_like(speed_profile)
 
-    # --------------------------------------------------------
-    # Build controller
-    # --------------------------------------------------------
-
     controller = NMPCController(path, veh_ctrl, ctrl_par, model_ctrl)
 
-    # Initial state: [e_y, e_psi, v_y, r, delta]
     x = np.array([0.0, np.deg2rad(2.0), 0.0, 0.0, 0.0], dtype=float)
     s_current = 0.0
 
-    # --------------------------------------------------------
-    # Logs
-    # --------------------------------------------------------
-
     t_log = []
-    x_log = []
-    y_log = []
     ey_log = []
     epsi_log = []
     vy_log = []
@@ -1165,20 +1359,14 @@ def main():
     ddelta_log = []
     s_log = []
     vx_log = []
-    ax_log = []
     kappa_log = []
     solve_time_log = []
     iter_log = []
     hard_fail_log = []
     soft_fail_log = []
-    status_log = []
 
     steps = int(sim_par.sim_time / sim_par.dt)
     terminal_margin = 3.0
-
-    # --------------------------------------------------------
-    # Simulation loop
-    # --------------------------------------------------------
 
     for k in range(steps):
         s_preview, kappa_preview, vx_preview, ax_preview = preview_path_data(
@@ -1189,49 +1377,29 @@ def main():
         soft_failed = 0
 
         try:
-            _, U_opt, solve_time, iter_count, return_status, soft_failure = controller.solve(
+            _, U_opt, solve_time, iter_count, _, soft_failure = controller.solve(
                 x, kappa_preview, vx_preview, ax_preview
             )
-
             u = U_opt[0]
 
             if soft_failure:
                 soft_failed = 1
-                print(f"[SOFT WARNING] Step {k}: IPOPT status = {return_status}, using solution.")
 
-        except RuntimeError as err:
-            print(f"\n[HARD WARNING] Solver failed at step {k}: {err}")
-            print("State at hard failure:")
-            print(f"e_y     = {x[0]:.3f} m")
-            print(f"e_psi   = {np.rad2deg(x[1]):.3f} deg")
-            print(f"v_y     = {x[2]:.3f} m/s")
-            print(f"r       = {x[3]:.3f} rad/s")
-            print(f"delta   = {np.rad2deg(x[4]):.3f} deg")
-            print(f"s       = {s_current:.3f} m")
-            print(f"kappa   = {path.interp_kappa(s_current):.5f} 1/m")
-
+        except RuntimeError:
             hard_failed = 1
-            return_status = "HARD_FAILURE"
-
-            # Safe fallback in simulation: steer back toward zero
             u = np.array([-x[4] / sim_par.dt])
             u[0] = np.clip(u[0], -controller.ddelta_max, controller.ddelta_max)
-
             solve_time = np.nan
             iter_count = np.nan
 
-        x, s_current, vx_now, ax_now = simulate_step(
+        x, s_current, vx_now, _ = simulate_step(
             x, s_current, u, path, speed_profile, ax_profile,
             veh_plant, sim_par, model_plant
         )
 
-        xg, yg, _ = path.global_from_error_state(s_current, x[0], x[1])
-
         t = k * sim_par.dt
 
         t_log.append(t)
-        x_log.append(xg)
-        y_log.append(yg)
         ey_log.append(x[0])
         epsi_log.append(x[1])
         vy_log.append(x[2])
@@ -1240,24 +1408,16 @@ def main():
         ddelta_log.append(float(u[0]))
         s_log.append(s_current)
         vx_log.append(vx_now)
-        ax_log.append(ax_now)
         kappa_log.append(path.interp_kappa(s_current))
         solve_time_log.append(solve_time)
         iter_log.append(iter_count)
         hard_fail_log.append(hard_failed)
         soft_fail_log.append(soft_failed)
-        status_log.append(return_status)
 
         if s_current >= path.length - terminal_margin:
             break
 
-    # --------------------------------------------------------
-    # Convert logs to arrays
-    # --------------------------------------------------------
-
     t_log = np.array(t_log)
-    x_log = np.array(x_log)
-    y_log = np.array(y_log)
     ey_log = np.array(ey_log)
     epsi_log = np.array(epsi_log)
     vy_log = np.array(vy_log)
@@ -1266,16 +1426,11 @@ def main():
     ddelta_log = np.array(ddelta_log)
     s_log = np.array(s_log)
     vx_log = np.array(vx_log)
-    ax_log = np.array(ax_log)
     kappa_log = np.array(kappa_log)
     solve_time_log = np.array(solve_time_log)
     iter_log = np.array(iter_log)
     hard_fail_log = np.array(hard_fail_log)
     soft_fail_log = np.array(soft_fail_log)
-
-    # --------------------------------------------------------
-    # Metrics
-    # --------------------------------------------------------
 
     metrics = compute_metrics(
         t_log=t_log,
@@ -1293,136 +1448,143 @@ def main():
         path=path,
     )
 
-    print_metrics_table(metrics)
-    print_csv_and_latex_rows(metrics)
+    ay_demand = vx_log**2 * np.abs(kappa_log)
 
-    # --------------------------------------------------------
-    # Experiment info
-    # --------------------------------------------------------
+    metrics["max_abs_vy_m_s"] = safe_nanmax(np.abs(vy_log))
+    metrics["max_abs_r_rad_s"] = safe_nanmax(np.abs(r_log))
+    metrics["mean_ay_demand_m_s2"] = safe_nanmean(ay_demand)
+    metrics["max_ay_demand_m_s2"] = safe_nanmax(ay_demand)
+    metrics["mu_g_plant_m_s2"] = cfg.mu_plant * 9.81
+    metrics["max_ay_over_mu_g"] = metrics["max_ay_demand_m_s2"] / metrics["mu_g_plant_m_s2"]
+
+    info = {
+        "experiment": cfg.name,
+        "group": cfg.group,
+        "path_name": path_name,
+        "path_type": cfg.path_type,
+        "synthetic_path": cfg.synthetic_path,
+        "vegsystemreferanse": cfg.vegsystemreferanse,
+        "kommune": cfg.kommune,
+        "path_length_m": path.length,
+        "num_waypoints": len(x_wp),
+        "path_max_abs_kappa": float(np.max(np.abs(path.kappa))),
+        "path_mean_abs_kappa": float(np.mean(np.abs(path.kappa))),
+        "ctrl_model": cfg.tire_model_ctrl,
+        "plant_model": cfg.tire_model_plant,
+        "mu_ctrl": cfg.mu_ctrl,
+        "mu_plant": cfg.mu_plant,
+        "stiffness_scale_ctrl": cfg.stiffness_scale_ctrl,
+        "stiffness_scale_plant": cfg.stiffness_scale_plant,
+        "vx_nominal": cfg.vx_nominal,
+        "vx_min": cfg.vx_min,
+        "vx_max": cfg.vx_max,
+        "ay_max": cfg.ay_max,
+        "N": cfg.N,
+        "dt": cfg.dt,
+        "sim_time": cfg.sim_time,
+        "failed": False,
+        "error": "",
+    }
+
+    return {**info, **metrics}
+
+
+def save_results_to_csv(rows, filename):
+    if len(rows) == 0:
+        return
+
+    keys = []
+    for row in rows:
+        for key in row:
+            if key not in keys:
+                keys.append(key)
+
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def main():
+    output_dir = "experiment_results"
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_csv = os.path.join(output_dir, "nmpc_experiment_results.csv")
+
+    experiments = build_experiment_list()
+    path_cache = {}
+    rows = []
 
     print("\n" + "=" * 80)
-    print("EXPERIMENT SETUP")
+    print("RUNNING NMPC EXPERIMENT BATCH")
     print("=" * 80)
-    print(f"Path:                       {path_name}")
-    print(f"Vegsystemreferanse:         {vegsystemreferanse}")
-    print(f"Kommune:                    {kommune}")
-    print(f"Path length:                {path.length:.2f} m")
-    print(f"Number of NVDB waypoints:   {len(x_wp)}")
-    print(f"Max |kappa| path:           {np.max(np.abs(path.kappa)):.6f} 1/m")
-    print(f"Controller tire model:      {model_ctrl.tire_model}")
-    print(f"Plant tire model:           {model_plant.tire_model}")
-    print(f"Controller mu:              {veh_ctrl.mu:.2f}")
-    print(f"Plant mu:                   {veh_plant.mu:.2f}")
-    print(f"Controller stiffness scale: {stiffness_scale_ctrl:.3f}")
-    print(f"Plant stiffness scale:      {stiffness_scale_plant:.3f}")
-    print(f"Controller Cf:              {veh_ctrl.Cf:.1f} N/rad")
-    print(f"Controller Cr:              {veh_ctrl.Cr:.1f} N/rad")
-    print(f"Plant Cf:                   {veh_plant.Cf:.1f} N/rad")
-    print(f"Plant Cr:                   {veh_plant.Cr:.1f} N/rad")
+    print(f"Number of experiments: {len(experiments)}")
+    print(f"Output CSV: {output_csv}")
 
-    if model_plant.tire_model == "pacejka":
-        Fzf, Fzr, Df, Dr, Bf, Br = compute_pacejka_report_values(veh_plant, model_plant)
+    batch_start = time.perf_counter()
 
-        print("\nSimplified Pacejka plant parameters")
-        print("  D is computed dynamically as D = mu * Fz")
-        print("  B is computed dynamically to preserve initial cornering stiffness")
-        print(f"  Front Fz:                 {Fzf:.1f} N")
-        print(f"  Front B:                  {Bf:.4f} 1/deg")
-        print(f"  Front C:                  {model_plant.pacejka_Cf_shape:.4f}")
-        print(f"  Front D = mu*Fz:          {Df:.1f} N")
-        print(f"  Front E:                  {model_plant.pacejka_Ef:.4f}")
-        print(f"  Rear Fz:                  {Fzr:.1f} N")
-        print(f"  Rear B:                   {Br:.4f} 1/deg")
-        print(f"  Rear C:                   {model_plant.pacejka_Cr_shape:.4f}")
-        print(f"  Rear D = mu*Fz:           {Dr:.1f} N")
-        print(f"  Rear E:                   {model_plant.pacejka_Er:.4f}")
+    for i, cfg in enumerate(experiments, start=1):
+        print("\n" + "-" * 80)
+        print(f"[{i}/{len(experiments)}] Running: {cfg.name}")
+        print("-" * 80)
 
-    print(f"\nvx_nominal:                 {speed_par.vx_nominal:.2f} m/s")
-    print(f"vx_min:                     {speed_par.vx_min:.2f} m/s")
-    print(f"vx_max:                     {speed_par.vx_max:.2f} m/s")
-    print(f"ay_max:                     {speed_par.ay_max:.2f} m/s^2")
-    print(f"N:                          {ctrl_par.N}")
-    print(f"dt:                         {ctrl_par.dt:.3f} s")
+        t0 = time.perf_counter()
 
-    # --------------------------------------------------------
-    # Plotting
-    # --------------------------------------------------------
+        try:
+            row = run_experiment(cfg, path_cache)
+            row["wall_time_s"] = time.perf_counter() - t0
+            rows.append(row)
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(path.x, path.y, "--", label="Reference path")
-    plt.plot(x_log, y_log, label="Vehicle path")
-    plt.plot(x_wp, y_wp, "o", alpha=0.4, markersize=3, label="NVDB waypoints")
-    plt.axis("equal")
-    plt.xlabel("x [m]")
-    plt.ylabel("y [m]")
-    plt.title(f"NMPC path following - {path_name}")
-    plt.grid(True)
-    plt.legend()
+            print(f"Finished: {cfg.name}")
+            print(f"  RMS e_y:        {row['rms_ey_m']:.4f} m")
+            print(f"  Max |e_y|:      {row['max_abs_ey_m']:.4f} m")
+            print(f"  Completion:     {row['completion_pct']:.2f} %")
+            print(f"  Avg solve time: {row['avg_solve_ms']:.2f} ms")
+            print(f"  Hard failures:  {row['hard_failures']}")
+            print(f"  Soft warnings:  {row['soft_warnings']}")
 
-    fig, axs = plt.subplots(4, 2, figsize=(14, 14))
-    axs = axs.ravel()
+        except Exception as e:
+            error_text = traceback.format_exc()
 
-    axs[0].plot(path.s, speed_profile)
-    axs[0].set_title("Curvature-aware speed profile")
-    axs[0].set_xlabel("s [m]")
-    axs[0].set_ylabel("v_x [m/s]")
-    axs[0].grid(True)
+            print(f"FAILED: {cfg.name}")
+            print(str(e))
 
-    axs[1].plot(t_log, ey_log)
-    axs[1].set_title("Cross-track error")
-    axs[1].set_xlabel("Time [s]")
-    axs[1].set_ylabel("e_y [m]")
-    axs[1].grid(True)
+            rows.append({
+                "experiment": cfg.name,
+                "group": cfg.group,
+                "path_type": cfg.path_type,
+                "synthetic_path": cfg.synthetic_path,
+                "vegsystemreferanse": cfg.vegsystemreferanse,
+                "kommune": cfg.kommune,
+                "ctrl_model": cfg.tire_model_ctrl,
+                "plant_model": cfg.tire_model_plant,
+                "mu_ctrl": cfg.mu_ctrl,
+                "mu_plant": cfg.mu_plant,
+                "stiffness_scale_ctrl": cfg.stiffness_scale_ctrl,
+                "stiffness_scale_plant": cfg.stiffness_scale_plant,
+                "vx_nominal": cfg.vx_nominal,
+                "vx_min": cfg.vx_min,
+                "vx_max": cfg.vx_max,
+                "ay_max": cfg.ay_max,
+                "N": cfg.N,
+                "dt": cfg.dt,
+                "sim_time": cfg.sim_time,
+                "failed": True,
+                "error": str(e),
+                "traceback": error_text,
+                "wall_time_s": time.perf_counter() - t0,
+            })
 
-    axs[2].plot(t_log, np.rad2deg(epsi_log))
-    axs[2].set_title("Heading error")
-    axs[2].set_xlabel("Time [s]")
-    axs[2].set_ylabel("e_psi [deg]")
-    axs[2].grid(True)
+        save_results_to_csv(rows, output_csv)
 
-    axs[3].plot(t_log, np.rad2deg(delta_log), label="delta")
-    axs[3].plot(t_log, np.rad2deg(ddelta_log), label="delta_dot")
-    axs[3].set_title("Steering states")
-    axs[3].set_xlabel("Time [s]")
-    axs[3].set_ylabel("[deg], [deg/s]")
-    axs[3].legend()
-    axs[3].grid(True)
+    total_time = time.perf_counter() - batch_start
 
-    axs[4].plot(t_log, vy_log, label="v_y")
-    axs[4].plot(t_log, r_log, label="r")
-    axs[4].set_title("Dynamic states")
-    axs[4].set_xlabel("Time [s]")
-    axs[4].set_ylabel("[m/s], [rad/s]")
-    axs[4].legend()
-    axs[4].grid(True)
-
-    axs[5].plot(t_log, vx_log, label="v_x")
-    axs[5].plot(t_log, s_log, label="s")
-    axs[5].set_title("Speed and path progress")
-    axs[5].set_xlabel("Time [s]")
-    axs[5].set_ylabel("v_x [m/s], s [m]")
-    axs[5].legend()
-    axs[5].grid(True)
-
-    if np.any(~np.isnan(solve_time_log)):
-        axs[6].plot(t_log, 1000.0 * solve_time_log, label="Solve time")
-    axs[6].set_title("NMPC solve time")
-    axs[6].set_xlabel("Time [s]")
-    axs[6].set_ylabel("Solve time [ms]")
-    axs[6].legend()
-    axs[6].grid(True)
-
-    axs[7].plot(t_log, soft_fail_log, drawstyle="steps-post", label="Soft warning")
-    axs[7].plot(t_log, hard_fail_log, drawstyle="steps-post", label="Hard failure")
-    axs[7].set_title("Solver warnings and failures")
-    axs[7].set_xlabel("Time [s]")
-    axs[7].set_ylabel("Flag [-]")
-    axs[7].set_ylim(-0.1, 1.1)
-    axs[7].legend()
-    axs[7].grid(True)
-
-    fig.tight_layout()
-    plt.show()
+    print("\n" + "=" * 80)
+    print("BATCH FINISHED")
+    print("=" * 80)
+    print(f"Total experiments: {len(experiments)}")
+    print(f"Saved results to: {output_csv}")
+    print(f"Total wall time: {total_time:.1f} s")
 
 
 if __name__ == "__main__":
