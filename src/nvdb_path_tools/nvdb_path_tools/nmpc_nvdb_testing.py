@@ -1,7 +1,9 @@
 import time
+import requests
 import numpy as np
 import casadi as ca
 import matplotlib.pyplot as plt
+from shapely import wkt
 from scipy.interpolate import CubicSpline
 from dataclasses import dataclass
 
@@ -108,37 +110,145 @@ class ModelParams:
     traction_front_frac: float = 0.6
     braking_front_frac: float = 0.7
 
-    # Simplified Pacejka parameters.
-    # These are only used by the NumPy plant model when tire_model == "pacejka".
-    # The B parameters assume slip angle in degrees.
-    # D is doubled because the bicycle model uses axle-equivalent lateral force.
-    pacejka_Bf: float = 0.212
+    # Simplified Pacejka shape parameters.
+    # IMPORTANT:
+    # D is not fixed anymore. It is computed as D = mu * Fz.
+    # B is computed automatically so that the initial slope equals C_alpha.
     pacejka_Cf_shape: float = 1.219
-    pacejka_Df: float = 2.0 * 4220.0
     pacejka_Ef: float = -1.02
 
-    pacejka_Br: float = 0.239
     pacejka_Cr_shape: float = 1.207
-    pacejka_Dr: float = 2.0 * 3560.0
     pacejka_Er: float = -0.65
 
 
 @dataclass
 class SpeedProfileParams:
-    vx_nominal: float = 6.0
+    vx_nominal: float = 7.0
     vx_min: float = 3.0
-    vx_max: float = 8.0
+    vx_max: float = 10.0
     ay_max: float = 1.5
 
 
 @dataclass
 class SimulationParams:
     dt: float = 0.1
-    sim_time: float = 50.0
+    sim_time: float = 80.0
 
 
 # ============================================================
-# Path generation
+# NVDB path generation
+# ============================================================
+
+def sort_points_from_start(points, start_point):
+    points = np.array(points, dtype=float)
+    sorted_points = [np.array(start_point, dtype=float)]
+    remaining = points.copy()
+
+    d = np.linalg.norm(remaining - start_point, axis=1)
+    remaining = np.delete(remaining, np.argmin(d), axis=0)
+
+    while len(remaining) > 0:
+        last = sorted_points[-1]
+        d = np.linalg.norm(remaining - last, axis=1)
+        idx = np.argmin(d)
+        sorted_points.append(remaining[idx])
+        remaining = np.delete(remaining, idx, axis=0)
+
+    return np.array(sorted_points)
+
+
+def fetch_nvdb_waypoints(
+    vegsystemreferanse="KV1253",
+    kommune="3201",
+    max_points=300,
+):
+    url = "https://nvdbapiles.atlas.vegvesen.no/vegnett/api/v4/veglenkesekvenser"
+
+    params = {
+        "vegsystemreferanse": vegsystemreferanse,
+        "kommune": kommune,
+    }
+
+    headers = {
+        "X-Client": "ntnu-masteroppgave-nmpc"
+    }
+
+    resp = requests.get(url, params=params, headers=headers, timeout=25)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if "objekter" not in data or len(data["objekter"]) == 0:
+        raise ValueError("Ingen NVDB-objekter funnet.")
+
+    alle_segmenter = []
+
+    for item in data["objekter"]:
+        for veglenke in item.get("veglenker", []):
+            geom = veglenke.get("geometri", {}).get("wkt", "")
+
+            if not geom or not geom.startswith("LINESTRING"):
+                continue
+
+            startpos = veglenke.get("startposisjon", 0.0)
+            sluttpos = veglenke.get("sluttposisjon", 0.0)
+            retning = veglenke.get("retning", "").upper()
+            reversert = veglenke.get("reversert", False)
+
+            overlap = False
+            for s_start, s_slutt, _ in alle_segmenter:
+                if not (sluttpos <= s_start or startpos >= s_slutt):
+                    overlap = True
+                    break
+
+            if overlap:
+                continue
+
+            line = wkt.loads(geom)
+            x, y = line.xy
+            segment = list(zip(x, y))
+
+            if retning == "MOT" or reversert:
+                segment = segment[::-1]
+
+            alle_segmenter.append((startpos, sluttpos, segment))
+
+    if len(alle_segmenter) == 0:
+        raise ValueError("Ingen gyldige LINESTRING-segmenter funnet fra NVDB.")
+
+    alle_segmenter.sort(key=lambda s: s[0])
+
+    startpunkt = alle_segmenter[0][2][0]
+    alle_punkter = [p for _, _, seg in alle_segmenter for p in seg]
+
+    sorted_pts_global = sort_points_from_start(alle_punkter, startpunkt)
+
+    x = sorted_pts_global[:, 0].copy()
+    y = sorted_pts_global[:, 1].copy()
+
+    x -= startpunkt[0]
+    y -= startpunkt[1]
+
+    dist = np.zeros(len(x))
+    for i in range(1, len(x)):
+        dist[i] = dist[i - 1] + np.hypot(x[i] - x[i - 1], y[i] - y[i - 1])
+
+    mask = np.diff(dist, prepend=-1.0) > 1e-6
+    x = x[mask]
+    y = y[mask]
+
+    if len(x) < 4:
+        raise ValueError("For få gyldige NVDB-punkter til spline.")
+
+    if max_points is not None and len(x) > max_points:
+        idx = np.linspace(0, len(x) - 1, max_points).astype(int)
+        x = x[idx]
+        y = y[idx]
+
+    return x, y
+
+
+# ============================================================
+# Path representation
 # ============================================================
 
 class SplinePath:
@@ -302,36 +412,39 @@ def dugoff_lateral_force_np(alpha, Fz, C_alpha, mu, Fx=0.0):
     return C_alpha * tan_alpha * f_lam
 
 
-def pacejka_lateral_force_np(alpha_rad, B, C, D, E):
+def pacejka_lateral_force_np(alpha_rad, Fz, C_alpha, mu, C_shape, E):
     """
-    Simplified Pacejka lateral force.
+    Simplified pure lateral Pacejka Magic Formula.
 
-    alpha_rad:
-        Slip angle from vehicle model, in radians.
+    The classical form is
+        Fy = D sin(C atan(B alpha - E(B alpha - atan(B alpha))))
 
-    B:
-        Stiffness factor in 1/deg. Therefore alpha is converted to degrees.
+    Here:
+        D = mu * Fz
 
-    D:
-        Peak lateral force. Here D should be axle-equivalent because the
-        dynamic bicycle model uses one front and one rear lateral force.
+    B is computed so that the initial slope around alpha = 0 equals C_alpha.
+    Since alpha is internally converted to degrees, B has unit 1/deg:
+        C_alpha [N/rad] = B[1/deg] * C * D[N] * 180/pi
+        B = C_alpha / (C * D * 180/pi)
     """
+
     alpha_deg = np.rad2deg(alpha_rad)
 
+    D = mu * Fz
+    if D <= 1e-6:
+        return 0.0
+
+    B = C_alpha / (C_shape * D * (180.0 / np.pi))
+
     return D * np.sin(
-        C * np.arctan(
-            B * alpha_deg - E * (B * alpha_deg - np.arctan(B * alpha_deg))
+        C_shape * np.arctan(
+            B * alpha_deg
+            - E * (B * alpha_deg - np.arctan(B * alpha_deg))
         )
     )
 
 
 def lateral_force_casadi(alpha, Fz, C_alpha, mu, Fx, model_par: ModelParams):
-    """
-    Tire force model used inside the NMPC prediction model.
-
-    Deliberately supports only "linear" and "dugoff".
-    Pacejka is not included in the controller.
-    """
     if model_par.tire_model == "linear":
         return linear_lateral_force(alpha, C_alpha)
 
@@ -345,14 +458,6 @@ def lateral_force_casadi(alpha, Fz, C_alpha, mu, Fx, model_par: ModelParams):
 
 
 def lateral_force_np(alpha, Fz, C_alpha, mu, Fx, model_par: ModelParams, axle="front"):
-    """
-    Tire force model used in the simulated plant.
-
-    Supports:
-    - "linear"
-    - "dugoff"
-    - "pacejka"
-    """
     if model_par.tire_model == "linear":
         return linear_lateral_force_np(alpha, C_alpha)
 
@@ -362,20 +467,22 @@ def lateral_force_np(alpha, Fz, C_alpha, mu, Fx, model_par: ModelParams, axle="f
     if model_par.tire_model == "pacejka":
         if axle == "front":
             return pacejka_lateral_force_np(
-                alpha,
-                model_par.pacejka_Bf,
-                model_par.pacejka_Cf_shape,
-                model_par.pacejka_Df,
-                model_par.pacejka_Ef
+                alpha_rad=alpha,
+                Fz=Fz,
+                C_alpha=C_alpha,
+                mu=mu,
+                C_shape=model_par.pacejka_Cf_shape,
+                E=model_par.pacejka_Ef,
             )
 
         if axle == "rear":
             return pacejka_lateral_force_np(
-                alpha,
-                model_par.pacejka_Br,
-                model_par.pacejka_Cr_shape,
-                model_par.pacejka_Dr,
-                model_par.pacejka_Er
+                alpha_rad=alpha,
+                Fz=Fz,
+                C_alpha=C_alpha,
+                mu=mu,
+                C_shape=model_par.pacejka_Cr_shape,
+                E=model_par.pacejka_Er,
             )
 
         raise ValueError(f"Unknown axle: {axle}")
@@ -387,7 +494,6 @@ def lateral_force_np(alpha, Fz, C_alpha, mu, Fx, model_par: ModelParams, axle="f
 # Continuous dynamics
 # x = [ey, epsi, vy, r, delta]
 # u = [delta_dot]
-# s is not a state
 # ============================================================
 
 def continuous_dynamics_casadi(x, u, kappa, vx, ax, veh, model_par):
@@ -796,7 +902,6 @@ def compute_metrics(
     cnxte_signal = abs_ey * abs_kappa
 
     metrics = {
-
         "rms_ey_m": np.sqrt(safe_nanmean(ey_log**2)),
         "max_abs_ey_m": safe_nanmax(abs_ey),
         "p95_abs_ey_m": safe_nanpercentile(abs_ey, 95),
@@ -946,19 +1051,20 @@ def print_csv_and_latex_rows(metrics):
 
 
 # ============================================================
-# Test paths
+# Pacejka parameter reporting helper
 # ============================================================
 
-def create_mild_waypoints():
-    x_wp = np.array([0, 10, 20, 30, 40, 50, 60, 70, 80, 90], dtype=float)
-    y_wp = np.array([0,  0,  0,  1,  3,  6,  8,  9,  9,  9], dtype=float)
-    return x_wp, y_wp
+def compute_pacejka_report_values(veh: VehicleParams, model_par: ModelParams):
+    Fzf = veh.m * veh.g * veh.lr / veh.L
+    Fzr = veh.m * veh.g * veh.lf / veh.L
 
+    Df = veh.mu * Fzf
+    Dr = veh.mu * Fzr
 
-def create_sharp_waypoints():
-    x_wp = np.array([0, 10, 20, 30, 40, 50, 55, 60, 65, 75, 90, 110], dtype=float)
-    y_wp = np.array([0,  0,  0,  2,  8, 18, 28, 35, 38, 36, 30, 25], dtype=float)
-    return x_wp, y_wp
+    Bf = veh.Cf / (model_par.pacejka_Cf_shape * Df * (180.0 / np.pi)) if Df > 1e-6 else np.nan
+    Br = veh.Cr / (model_par.pacejka_Cr_shape * Dr * (180.0 / np.pi)) if Dr > 1e-6 else np.nan
+
+    return Fzf, Fzr, Df, Dr, Bf, Br
 
 
 # ============================================================
@@ -967,16 +1073,23 @@ def create_sharp_waypoints():
 
 def main():
 
+    # --------------------------------------------------------
+    # Experiment setup
+    # --------------------------------------------------------
+
+    vegsystemreferanse = "KV1253"
+    kommune = "3201"
+
     tire_model_ctrl = "linear"       # "linear" or "dugoff"
     tire_model_plant = "pacejka"     # "linear", "dugoff", or "pacejka"
-
-    use_mild_path = False
 
     stiffness_scale_ctrl = 1.00
     stiffness_scale_plant = 1.00
 
     mu_ctrl = 0.80
     mu_plant = 0.80
+
+    use_longitudinal_acc_profile = False
 
     ctrl_par = ControllerParams()
     sim_par = SimulationParams()
@@ -1005,26 +1118,41 @@ def main():
         mu=mu_plant
     )
 
-    if use_mild_path:
-        path_name = "mild"
-        x_wp, y_wp = create_mild_waypoints()
-    else:
-        path_name = "sharp"
-        x_wp, y_wp = create_sharp_waypoints()
+    # --------------------------------------------------------
+    # Build NVDB path
+    # --------------------------------------------------------
+
+    path_name = f"NVDB_{vegsystemreferanse}"
+
+    print("\nFetching NVDB path...")
+    x_wp, y_wp = fetch_nvdb_waypoints(
+        vegsystemreferanse=vegsystemreferanse,
+        kommune=kommune,
+        max_points=300,
+    )
 
     path = SplinePath(x_wp, y_wp, ds=0.5)
 
     speed_profile = build_curvature_aware_speed_profile(path, speed_par)
 
-    ax_profile = np.zeros_like(speed_profile)
+    if use_longitudinal_acc_profile:
+        ax_profile = build_longitudinal_acc_profile(path, speed_profile)
+    else:
+        ax_profile = np.zeros_like(speed_profile)
 
-    # Later test:
-    # ax_profile = build_longitudinal_acc_profile(path, speed_profile)
+    # --------------------------------------------------------
+    # Build controller
+    # --------------------------------------------------------
 
     controller = NMPCController(path, veh_ctrl, ctrl_par, model_ctrl)
 
+    # Initial state: [e_y, e_psi, v_y, r, delta]
     x = np.array([0.0, np.deg2rad(2.0), 0.0, 0.0, 0.0], dtype=float)
     s_current = 0.0
+
+    # --------------------------------------------------------
+    # Logs
+    # --------------------------------------------------------
 
     t_log = []
     x_log = []
@@ -1047,6 +1175,10 @@ def main():
 
     steps = int(sim_par.sim_time / sim_par.dt)
     terminal_margin = 3.0
+
+    # --------------------------------------------------------
+    # Simulation loop
+    # --------------------------------------------------------
 
     for k in range(steps):
         s_preview, kappa_preview, vx_preview, ax_preview = preview_path_data(
@@ -1081,6 +1213,7 @@ def main():
             hard_failed = 1
             return_status = "HARD_FAILURE"
 
+            # Safe fallback in simulation: steer back toward zero
             u = np.array([-x[4] / sim_par.dt])
             u[0] = np.clip(u[0], -controller.ddelta_max, controller.ddelta_max)
 
@@ -1118,6 +1251,10 @@ def main():
         if s_current >= path.length - terminal_margin:
             break
 
+    # --------------------------------------------------------
+    # Convert logs to arrays
+    # --------------------------------------------------------
+
     t_log = np.array(t_log)
     x_log = np.array(x_log)
     y_log = np.array(y_log)
@@ -1136,6 +1273,10 @@ def main():
     hard_fail_log = np.array(hard_fail_log)
     soft_fail_log = np.array(soft_fail_log)
 
+    # --------------------------------------------------------
+    # Metrics
+    # --------------------------------------------------------
+
     metrics = compute_metrics(
         t_log=t_log,
         ey_log=ey_log,
@@ -1153,12 +1294,20 @@ def main():
     )
 
     print_metrics_table(metrics)
+    print_csv_and_latex_rows(metrics)
+
+    # --------------------------------------------------------
+    # Experiment info
+    # --------------------------------------------------------
 
     print("\n" + "=" * 80)
     print("EXPERIMENT SETUP")
     print("=" * 80)
     print(f"Path:                       {path_name}")
+    print(f"Vegsystemreferanse:         {vegsystemreferanse}")
+    print(f"Kommune:                    {kommune}")
     print(f"Path length:                {path.length:.2f} m")
+    print(f"Number of NVDB waypoints:   {len(x_wp)}")
     print(f"Max |kappa| path:           {np.max(np.abs(path.kappa)):.6f} 1/m")
     print(f"Controller tire model:      {model_ctrl.tire_model}")
     print(f"Plant tire model:           {model_plant.tire_model}")
@@ -1172,31 +1321,41 @@ def main():
     print(f"Plant Cr:                   {veh_plant.Cr:.1f} N/rad")
 
     if model_plant.tire_model == "pacejka":
+        Fzf, Fzr, Df, Dr, Bf, Br = compute_pacejka_report_values(veh_plant, model_plant)
+
         print("\nSimplified Pacejka plant parameters")
-        print(f"  Front B:                  {model_plant.pacejka_Bf:.4f} 1/deg")
+        print("  D is computed dynamically as D = mu * Fz")
+        print("  B is computed dynamically to preserve initial cornering stiffness")
+        print(f"  Front Fz:                 {Fzf:.1f} N")
+        print(f"  Front B:                  {Bf:.4f} 1/deg")
         print(f"  Front C:                  {model_plant.pacejka_Cf_shape:.4f}")
-        print(f"  Front D:                  {model_plant.pacejka_Df:.1f} N")
+        print(f"  Front D = mu*Fz:          {Df:.1f} N")
         print(f"  Front E:                  {model_plant.pacejka_Ef:.4f}")
-        print(f"  Rear B:                   {model_plant.pacejka_Br:.4f} 1/deg")
+        print(f"  Rear Fz:                  {Fzr:.1f} N")
+        print(f"  Rear B:                   {Br:.4f} 1/deg")
         print(f"  Rear C:                   {model_plant.pacejka_Cr_shape:.4f}")
-        print(f"  Rear D:                   {model_plant.pacejka_Dr:.1f} N")
+        print(f"  Rear D = mu*Fz:           {Dr:.1f} N")
         print(f"  Rear E:                   {model_plant.pacejka_Er:.4f}")
 
-    print(f"\nvx_nominal:               {speed_par.vx_nominal:.2f} m/s")
+    print(f"\nvx_nominal:                 {speed_par.vx_nominal:.2f} m/s")
     print(f"vx_min:                     {speed_par.vx_min:.2f} m/s")
     print(f"vx_max:                     {speed_par.vx_max:.2f} m/s")
     print(f"ay_max:                     {speed_par.ay_max:.2f} m/s^2")
     print(f"N:                          {ctrl_par.N}")
     print(f"dt:                         {ctrl_par.dt:.3f} s")
 
+    # --------------------------------------------------------
+    # Plotting
+    # --------------------------------------------------------
+
     plt.figure(figsize=(10, 6))
     plt.plot(path.x, path.y, "--", label="Reference path")
     plt.plot(x_log, y_log, label="Vehicle path")
-    plt.plot(x_wp, y_wp, "o", alpha=0.5, label="Waypoints")
+    plt.plot(x_wp, y_wp, "o", alpha=0.4, markersize=3, label="NVDB waypoints")
     plt.axis("equal")
     plt.xlabel("x [m]")
     plt.ylabel("y [m]")
-    plt.title(f"NMPC path following")
+    plt.title(f"NMPC path following - {path_name}")
     plt.grid(True)
     plt.legend()
 
