@@ -27,6 +27,7 @@ setup(
             'path_publisher = nvdb_path_tools.path_publisher:main',
             'path_plotter = nvdb_path_tools.path_plotter:main',
             'nvdb_route_publisher = nvdb_path_tools.nvdb_route_publisher:main',
+            'nmpc_path_follower_node = nvdb_path_tools.nmpc_path_follower_node:main',
         ],
     },
 )

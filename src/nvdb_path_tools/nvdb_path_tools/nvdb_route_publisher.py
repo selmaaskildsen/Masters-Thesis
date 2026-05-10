@@ -143,7 +143,7 @@ class NvdbRoutePublisher(Node):
             self.get_logger().warn("overlap_ratio_threshold utenfor (0,1]. Setter til 0.7.")
             self._overlap_ratio_threshold = 0.7
 
-        self._path_pub = self.create_publisher(Path, "/reference_path", 10)
+        self._path_pub = self.create_publisher(Path, "/path", 10)
 
         self._path_msg: Optional[Path] = None
         self._next_retry_t: float = 0.0
@@ -212,7 +212,7 @@ class NvdbRoutePublisher(Node):
             self._next_retry_t = 0.0
 
             self.get_logger().info(
-                f"OK: Publiserer samlet rute med {len(path_msg.poses)} punkter på /reference_path."
+                f"OK: Publiserer samlet rute med {len(path_msg.poses)} punkter på /path."
             )
 
         except Exception as e:
