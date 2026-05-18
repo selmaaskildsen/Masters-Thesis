@@ -74,9 +74,6 @@ class ModelParams:
     denom_eps: float = 1e-3
     vx_eps: float = 0.5
 
-    # Fixed for ROS controller: Dugoff
-    tire_model: str = "dugoff"
-
     traction_front_frac: float = 0.6
     braking_front_frac: float = 0.7
 
@@ -146,14 +143,19 @@ class SplinePath:
 
 
 # ============================================================
-# Speed and preview
+# Speed profile and path preview
 # ============================================================
 
-def build_curvature_aware_speed_profile(path: SplinePath, speed_par: SpeedProfileParams):
+def build_curvature_aware_speed_profile(
+    path: SplinePath,
+    speed_par: SpeedProfileParams,
+):
     kappa_abs = np.abs(path.kappa)
+
     v_curve = np.sqrt(speed_par.ay_max / np.maximum(kappa_abs, 1e-4))
     v_profile = np.minimum(v_curve, speed_par.vx_nominal)
     v_profile = np.clip(v_profile, speed_par.vx_min, speed_par.vx_max)
+
     return v_profile
 
 
@@ -164,16 +166,36 @@ def estimate_sdot(ey, epsi, vy, vx, kappa, model_par: ModelParams):
         denom = np.sign(denom + 1e-9) * model_par.denom_eps
 
     sdot = (vx * np.cos(epsi) - vy * np.sin(epsi)) / denom
+
     return max(0.2, float(sdot))
 
 
-def preview_path_data(path, speed_profile, ax_profile, x, s_current, ctrl_par, model_par):
-    ey, epsi, vy = x[0], x[1], x[2]
+def preview_path_data(
+    path: SplinePath,
+    speed_profile: np.ndarray,
+    ax_profile: np.ndarray,
+    x: np.ndarray,
+    s_current: float,
+    ctrl_par: ControllerParams,
+    model_par: ModelParams,
+):
+    ey = x[0]
+    epsi = x[1]
+    vy = x[2]
 
-    vx0 = float(np.interp(np.clip(s_current, path.s[0], path.s[-1]), path.s, speed_profile))
-    kappa0 = path.interp_kappa(s_current)
+    s_clamped = np.clip(s_current, path.s[0], path.s[-1])
 
-    sdot0 = estimate_sdot(ey, epsi, vy, vx0, kappa0, model_par)
+    vx0 = float(np.interp(s_clamped, path.s, speed_profile))
+    kappa0 = path.interp_kappa(s_clamped)
+
+    sdot0 = estimate_sdot(
+        ey=ey,
+        epsi=epsi,
+        vy=vy,
+        vx=vx0,
+        kappa=kappa0,
+        model_par=model_par,
+    )
 
     s_preview = s_current + sdot0 * ctrl_par.dt * np.arange(ctrl_par.N + 1)
     s_preview = np.clip(s_preview, path.s[0], path.s[-1])
@@ -186,7 +208,7 @@ def preview_path_data(path, speed_profile, ax_profile, x, s_current, ctrl_par, m
 
 
 # ============================================================
-# Tire model
+# Dugoff tire model
 # ============================================================
 
 def split_longitudinal_force(Fx_total, model_par: ModelParams):
@@ -196,11 +218,10 @@ def split_longitudinal_force(Fx_total, model_par: ModelParams):
         model_par.braking_front_frac,
     )
 
-    return front_frac * Fx_total, (1.0 - front_frac) * Fx_total
+    Fx_f = front_frac * Fx_total
+    Fx_r = (1.0 - front_frac) * Fx_total
 
-
-def linear_lateral_force(alpha, C_alpha):
-    return C_alpha * alpha
+    return Fx_f, Fx_r
 
 
 def dugoff_lateral_force(alpha, Fz, C_alpha, mu, Fx=0.0):
@@ -209,30 +230,39 @@ def dugoff_lateral_force(alpha, Fz, C_alpha, mu, Fx=0.0):
     tan_alpha = ca.tan(alpha)
     tan_alpha = ca.fmin(ca.fmax(tan_alpha, -20.0), 20.0)
 
-    denom = 2.0 * ca.sqrt(Fx**2 + (C_alpha * tan_alpha)**2 + eps)
-    lam = mu * Fz / (denom + eps)
+    combined_force = ca.sqrt(Fx**2 + (C_alpha * tan_alpha)**2 + eps)
+    lam = mu * Fz / (2.0 * combined_force + eps)
 
-    f_lam = ca.if_else(lam < 1.0, lam * (2.0 - lam), 1.0)
+    saturation_factor = ca.if_else(
+        lam < 1.0,
+        lam * (2.0 - lam),
+        1.0,
+    )
 
-    return C_alpha * tan_alpha * f_lam
+    Fy = C_alpha * tan_alpha * saturation_factor
 
-
-def lateral_force_casadi(alpha, Fz, C_alpha, mu, Fx, model_par: ModelParams):
-    if model_par.tire_model != "dugoff":
-        raise ValueError(
-            f"ROS controller is configured for Dugoff only, but got tire_model='{model_par.tire_model}'."
-        )
-
-    return dugoff_lateral_force(alpha, Fz, C_alpha, mu, Fx)
+    return Fy
 
 
 # ============================================================
 # Dynamic bicycle model in path-relative error states
-# x = [ey, epsi, vy, r, delta]
-# u = [delta_dot]
+#
+# State:
+#   x = [e_y, e_psi, v_y, r, delta]
+#
+# Input:
+#   u = [delta_dot]
 # ============================================================
 
-def continuous_dynamics_casadi(x, u, kappa, vx, ax, veh, model_par):
+def continuous_dynamics_casadi(
+    x,
+    u,
+    kappa,
+    vx,
+    ax,
+    veh: VehicleParams,
+    model_par: ModelParams,
+):
     ey = x[0]
     epsi = x[1]
     vy = x[2]
@@ -249,10 +279,10 @@ def continuous_dynamics_casadi(x, u, kappa, vx, ax, veh, model_par):
     Cf = veh.Cf
     Cr = veh.Cr
     mu = veh.mu
-    g0 = veh.g
+    g = veh.g
 
-    Fzf = m * g0 * lr / (lf + lr)
-    Fzr = m * g0 * lf / (lf + lr)
+    Fzf = m * g * lr / (lf + lr)
+    Fzr = m * g * lf / (lf + lr)
 
     Fx_total = m * ax
     Fx_f, Fx_r = split_longitudinal_force(Fx_total, model_par)
@@ -260,8 +290,8 @@ def continuous_dynamics_casadi(x, u, kappa, vx, ax, veh, model_par):
     alpha_f = delta - ca.atan2(vy + lf * r, vx)
     alpha_r = -ca.atan2(vy - lr * r, vx)
 
-    Fyf = lateral_force_casadi(alpha_f, Fzf, Cf, mu, Fx_f, model_par)
-    Fyr = lateral_force_casadi(alpha_r, Fzr, Cr, mu, Fx_r, model_par)
+    Fyf = dugoff_lateral_force(alpha_f, Fzf, Cf, mu, Fx_f)
+    Fyr = dugoff_lateral_force(alpha_r, Fzr, Cr, mu, Fx_r)
 
     denom = 1.0 - kappa * ey
     denom = ca.if_else(
@@ -278,10 +308,25 @@ def continuous_dynamics_casadi(x, u, kappa, vx, ax, veh, model_par):
     r_dot = (lf * Fyf * ca.cos(delta) - lr * Fyr) / Iz
     delta_dot = ddelta
 
-    return ca.vertcat(ey_dot, epsi_dot, vy_dot, r_dot, delta_dot)
+    return ca.vertcat(
+        ey_dot,
+        epsi_dot,
+        vy_dot,
+        r_dot,
+        delta_dot,
+    )
 
 
-def rk4_step_casadi(x, u, kappa, vx, ax, veh, ctrl_par, model_par):
+def rk4_step_casadi(
+    x,
+    u,
+    kappa,
+    vx,
+    ax,
+    veh: VehicleParams,
+    ctrl_par: ControllerParams,
+    model_par: ModelParams,
+):
     dt = ctrl_par.dt
 
     k1 = continuous_dynamics_casadi(x, u, kappa, vx, ax, veh, model_par)
@@ -289,7 +334,7 @@ def rk4_step_casadi(x, u, kappa, vx, ax, veh, ctrl_par, model_par):
     k3 = continuous_dynamics_casadi(x + 0.5 * dt * k2, u, kappa, vx, ax, veh, model_par)
     k4 = continuous_dynamics_casadi(x + dt * k3, u, kappa, vx, ax, veh, model_par)
 
-    return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
 
 # ============================================================
@@ -297,7 +342,13 @@ def rk4_step_casadi(x, u, kappa, vx, ax, veh, ctrl_par, model_par):
 # ============================================================
 
 class NMPCController:
-    def __init__(self, path, veh_ctrl, ctrl_par, model_ctrl):
+    def __init__(
+        self,
+        path: SplinePath,
+        veh_ctrl: VehicleParams,
+        ctrl_par: ControllerParams,
+        model_ctrl: ModelParams,
+    ):
         self.path = path
         self.veh = veh_ctrl
         self.ctrl_par = ctrl_par
@@ -321,11 +372,11 @@ class NMPCController:
         L = self.veh.L
 
         X = ca.SX.sym("X", nx, N + 1)
-        U = ca.SX.sym("U", 1, N)
+        U = ca.SX.sym("U", self.nu, N)
 
         P = ca.SX.sym("P", nx + 3 * (N + 1))
 
-        cost = 0
+        cost = 0.0
         g = []
 
         g.append(X[:, 0] - P[0:nx])
@@ -339,14 +390,14 @@ class NMPCController:
             ax_k = P[nx + 2 * (N + 1) + k]
 
             x_next = rk4_step_casadi(
-                xk,
-                uk,
-                kappa_k,
-                vx_k,
-                ax_k,
-                self.veh,
-                self.ctrl_par,
-                self.model_par,
+                x=xk,
+                u=uk,
+                kappa=kappa_k,
+                vx=vx_k,
+                ax=ax_k,
+                veh=self.veh,
+                ctrl_par=self.ctrl_par,
+                model_par=self.model_par,
             )
 
             g.append(X[:, k + 1] - x_next)
@@ -372,6 +423,7 @@ class NMPCController:
                 cost += self.ctrl_par.r_ddelta_smooth * (U[0, k] - U[0, k - 1])**2
 
         xN = X[:, N]
+
         kappa_N = P[nx + N]
         vx_N = P[nx + (N + 1) + N]
 
@@ -384,7 +436,11 @@ class NMPCController:
         cost += self.ctrl_par.terminal_factor_r * self.ctrl_par.q_r * (xN[3] - r_ref_N)**2
         cost += self.ctrl_par.terminal_factor_delta * self.ctrl_par.q_delta * (xN[4] - delta_ref_N)**2
 
-        opt_vars = ca.vertcat(ca.reshape(X, -1, 1), ca.reshape(U, -1, 1))
+        opt_vars = ca.vertcat(
+            ca.reshape(X, -1, 1),
+            ca.reshape(U, -1, 1),
+        )
+
         g = ca.vertcat(*g)
 
         nlp = {
@@ -416,8 +472,21 @@ class NMPCController:
         ubx = []
 
         for _ in range(N + 1):
-            lbx += [-ey_max, -epsi_max, -vy_max, -r_max, -self.delta_max]
-            ubx += [ey_max, epsi_max, vy_max, r_max, self.delta_max]
+            lbx += [
+                -ey_max,
+                -epsi_max,
+                -vy_max,
+                -r_max,
+                -self.delta_max,
+            ]
+
+            ubx += [
+                ey_max,
+                epsi_max,
+                vy_max,
+                r_max,
+                self.delta_max,
+            ]
 
         for _ in range(N):
             lbx += [-self.ddelta_max]
@@ -428,7 +497,16 @@ class NMPCController:
         self.lbg = np.zeros(g.shape[0], dtype=float)
         self.ubg = np.zeros(g.shape[0], dtype=float)
 
-    def _make_initial_guess(self, x0, kappa_preview, vx_preview):
+    def reset_warm_start(self):
+        self.last_sol = None
+        self.last_u0 = np.array([0.0], dtype=float)
+
+    def _make_initial_guess(
+        self,
+        x0: np.ndarray,
+        kappa_preview: np.ndarray,
+        vx_preview: np.ndarray,
+    ):
         nX = self.nx * (self.N + 1)
         L = self.veh.L
 
@@ -447,24 +525,33 @@ class NMPCController:
             kappa_last = float(kappa_preview[-1])
             vx_last = float(vx_preview[-1])
 
-            X_guess[-1] = np.array([
-                0.0,
-                0.0,
-                0.0,
-                vx_last * kappa_last,
-                np.arctan(L * kappa_last),
-            ])
+            X_guess[-1] = np.array(
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    vx_last * kappa_last,
+                    np.arctan(L * kappa_last),
+                ],
+                dtype=float,
+            )
 
             U_guess[-1] = U_prev[-1]
 
-            return np.concatenate([X_guess.reshape(-1), U_guess.reshape(-1)])
+            return np.concatenate(
+                [
+                    X_guess.reshape(-1),
+                    U_guess.reshape(-1),
+                ]
+            )
 
         X_guess = np.zeros((self.N + 1, self.nx))
         U_guess = np.zeros((self.N, self.nu))
 
-        ey0, epsi0, _, _, _ = x0
-        decay = np.linspace(1.0, 0.0, self.N + 1)
+        ey0 = x0[0]
+        epsi0 = x0[1]
 
+        decay = np.linspace(1.0, 0.0, self.N + 1)
         delta_refs = np.zeros(self.N + 1)
 
         for k in range(self.N + 1):
@@ -488,11 +575,34 @@ class NMPCController:
                 self.ddelta_max,
             )
 
-        return np.concatenate([X_guess.reshape(-1), U_guess.reshape(-1)])
+        return np.concatenate(
+            [
+                X_guess.reshape(-1),
+                U_guess.reshape(-1),
+            ]
+        )
 
-    def solve(self, x0, kappa_preview, vx_preview, ax_preview):
-        p = np.concatenate([x0, kappa_preview, vx_preview, ax_preview])
-        w0 = self._make_initial_guess(x0, kappa_preview, vx_preview)
+    def solve(
+        self,
+        x0: np.ndarray,
+        kappa_preview: np.ndarray,
+        vx_preview: np.ndarray,
+        ax_preview: np.ndarray,
+    ):
+        p = np.concatenate(
+            [
+                x0,
+                kappa_preview,
+                vx_preview,
+                ax_preview,
+            ]
+        )
+
+        w0 = self._make_initial_guess(
+            x0=x0,
+            kappa_preview=kappa_preview,
+            vx_preview=vx_preview,
+        )
 
         t0 = time.perf_counter()
 
@@ -523,6 +633,7 @@ class NMPCController:
         self.last_sol = w_opt.copy()
 
         nX = self.nx * (self.N + 1)
+
         X_opt = w_opt[:nX].reshape((self.N + 1, self.nx))
         U_opt = w_opt[nX:].reshape((self.N, self.nu))
 
@@ -530,4 +641,12 @@ class NMPCController:
 
         soft_failure = (not success) and (return_status in acceptable_statuses)
 
-        return X_opt, U_opt, solve_time, stats.get("iter_count", np.nan), return_status, soft_failure
+        return (
+            X_opt,
+            U_opt,
+            solve_time,
+            stats.get("iter_count", np.nan),
+            return_status,
+            soft_failure,
+        )
+    

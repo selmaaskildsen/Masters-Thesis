@@ -1,11 +1,13 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 
 import numpy as np
 
 from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist, Vector3Stamped
 from std_msgs.msg import Float64, Bool
+from car_control.msg import VehicleState
 
 from nvdb_path_tools.nmpc_core import (
     NMPCController,
@@ -26,48 +28,126 @@ def yaw_from_quaternion(q):
     return np.arctan2(siny_cosp, cosy_cosp)
 
 
+def make_float64(value):
+    msg = Float64()
+    msg.data = float(value)
+    return msg
+
+
 class NMPCPathFollowerNode(Node):
+
+    STEERING_RATIO = 15.33
+    WHEELBASE = 2.79
 
     def __init__(self):
         super().__init__("nmpc_path_follower")
 
-        self.create_subscription(PoseStamped, "/pose", self.pose_callback, 10)
-        self.create_subscription(Path, "/path", self.path_callback, 10)
-        self.create_subscription(Float64, "/estimated_car_speed", self.speed_callback, 10)
-        self.create_subscription(Float64, "/steering_wheel_angle_filtered", self.steering_measurement_callback, 10)
+        # ---------------- Parameters ----------------
+        self.declare_parameter("publish_to_cmd_vel", False)
+        self.declare_parameter("desired_speed_mps", 4.0)
+        self.declare_parameter("torque_limit", 0.10)
+        self.declare_parameter("kp_speed", 0.3)
+        self.declare_parameter("path_csv_file", "") 
 
-        self.steering_pub = self.create_publisher(Float64, "/steering_angle_stanley", 10)
-        self.speed_pub = self.create_publisher(Float64, "/cruise_control_setpoint_speed", 10)
-        self.status_pub = self.create_publisher(Bool, "/path_following_status", 10)
+        self.publish_to_cmd_vel = self.get_parameter("publish_to_cmd_vel").value
 
-        self.pred_path_pub = self.create_publisher(Path, "/nmpc_prediction", 10)
-        self.next_pose_pub = self.create_publisher(PoseStamped, "/nmpc_next_pose", 10)
+        # ---------------- Subscriptions ----------------
+        self.create_subscription(PoseStamped, "gnss/pose", self.pose_callback, 10)
+        self.create_subscription(Vector3Stamped, "gnss/gyro", self.gyro_callback, 10)
+        self.create_subscription(VehicleState, "vehicle/state", self.vehicle_state_callback, 10)
+        self.create_subscription(Bool, "enable_path_following", self.enable_callback, 10)
 
-        self.timer = self.create_timer(0.1, self.control_loop)
+        # Support both possible path topic names
+        self.create_subscription(Path, "path", self.path_callback, 10)
+        self.create_subscription(Path, "reference_path", self.path_callback, 10)
 
+        # ---------------- Publishers ----------------
+        self.cmd_vel_pub = self.create_publisher(Twist, "cmd_vel", 10)
+        self.debug_cmd_vel_pub = self.create_publisher(Twist, "nmpc/debug_cmd_vel", 10)
+
+        qos_latched = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+        )
+
+        self.status_pub = self.create_publisher(Bool, "path_following_status", qos_latched)
+        self.path_vis_pub = self.create_publisher(Path, "path_visualization", qos_latched)
+
+        self.pub_cte = self.create_publisher(Float64, "lateral_mpc/cte_m", 10)
+        self.pub_hdg_err = self.create_publisher(Float64, "lateral_mpc/heading_error_deg", 10)
+        self.pub_desired_delta = self.create_publisher(Float64, "lateral_mpc/desired_delta_deg", 10)
+        self.pub_actual_delta = self.create_publisher(Float64, "lateral_mpc/actual_delta_deg", 10)
+        self.pub_torque_cmd = self.create_publisher(Float64, "lateral_mpc/torque_cmd", 10)
+        self.pub_progress = self.create_publisher(Float64, "lateral_mpc/progress_m", 10)
+
+        self.pub_lateral_error = self.create_publisher(Float64, "lateral_error", 10)
+        self.pub_heading_error = self.create_publisher(Float64, "heading_error", 10)
+        self.pub_pf_cmd_vel = self.create_publisher(Twist, "path_follower/cmd_vel", 10)
+
+        self.pred_path_pub = self.create_publisher(Path, "nmpc_prediction", 10)
+
+        self.pub_solve_time = self.create_publisher(Float64, "nmpc/solve_time_ms", 10)
+        self.pub_speed_gate = self.create_publisher(Bool, "nmpc/speed_gate_active", 10)
+        self.pub_yaw_rate_source = self.create_publisher(Float64, "nmpc/yaw_rate_source", 10)
+
+        # ---------------- Timer ----------------
+        self.timer_period = 0.1
+        self.timer = self.create_timer(self.timer_period, self.control_loop)
+
+        # ---------------- Vehicle state ----------------
         self.x = None
         self.y = None
         self.yaw = None
 
-        self.delta = 0.0
+        self.prev_yaw = None
+        self.prev_yaw_time = None
+        self.r_from_yaw = 0.0
+
+        self.vx = 0.0
         self.vy = 0.0
         self.r = 0.0
-        self.vx = 7.0
+
+        self.delta = 0.0
+        self.delta_rate = 0.0
+        self.prev_delta = None
+        self.prev_delta_time = None
+
         self.last_s = 0.0
         self.last_valid_delta_ref = 0.0
 
-        self.last_path_num_points = None
-        self.last_path_length_estimate = None
+        self.gnss_valid = False
+        self.gyro_valid = False
+        self.vehicle_state_valid = False
 
-        self.MAX_STEERING_ANGLE = np.arcsin(2.72 / (5.3 - 0.215 / 2.0))
-        self.MAX_STEERING_WHEEL_ANGLE = 460.0 * np.pi / 180.0
-        self.desired_speed_kmh = 8.0 * 3.6
+        self.last_pose_time = None
+        self.last_gyro_time = None
+        self.last_vehicle_state_time = None
+        self.max_data_age_s = 0.5
+
+        self.active = False
+        self.start_time = None
+
+        # ---------------- Robustness parameters ----------------
+        self.nmpc_enable_speed_mps = 3.2
+        self.nmpc_disable_speed_mps = 2.8
+        self.nmpc_speed_ok = False
+
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 5
+
+        self.soft_start_duration = 3.0
+
+        # ---------------- Control parameters ----------------
+        self.desired_speed_mps = float(self.get_parameter("desired_speed_mps").value)
+        self.kp_speed = float(self.get_parameter("kp_speed").value)
+        self.stop_distance = 3.0
+        self.torque_limit = float(self.get_parameter("torque_limit").value)
 
         self.ctrl_par = ControllerParams()
         self.speed_par = SpeedProfileParams()
 
         self.model_ctrl = ModelParams(
-            tire_model="dugoff",
             denom_eps=1e-3,
             vx_eps=0.5,
             traction_front_frac=0.6,
@@ -84,26 +164,95 @@ class NMPCPathFollowerNode(Node):
             mu=0.80,
         )
 
+        # ---------------- SchedFO2 steering model ----------------
+        self.sched_v_kmh = np.array(
+            [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 36.0, 40.0, 45.0, 50.0],
+            dtype=float,
+        )
+        self.sched_tau_r = np.array(
+            [2.953, 1.386, 0.722, 0.627, 0.437, 0.390, 0.342, 0.295, 0.247, 0.200],
+            dtype=float,
+        )
+        self.sched_kss = np.array(
+            [501.9, 314.9, 187.4, 143.2, 105.5, 84.6, 71.2, 63.3, 53.9, 44.1],
+            dtype=float,
+        )
+
+        # ---------------- Path and controller ----------------
         self.nmpc_path = None
         self.speed_profile = None
         self.ax_profile = None
         self.controller = None
 
-        self.create_fallback_path()
+        self.last_path_num_points = None
+        self.last_path_length_estimate = None
 
+        csv_file = self.get_parameter("path_csv_file").value
+        self.using_csv_path = bool(csv_file)
+
+        if csv_file:
+            self.load_path_from_csv(csv_file)
+        else:
+            self.create_fallback_path()
+
+        mode = "REAL /cmd_vel" if self.publish_to_cmd_vel else "DEBUG nmpc/debug_cmd_vel"
         self.get_logger().info(
-            "NMPC path follower initialized with dynamic bicycle model and Dugoff tire model."
+            f"NMPC path follower initialized. Mode: {mode}, torque_limit={self.torque_limit:.2f}"
         )
+
+    # ============================================================
+    # Setup helpers
+    # ============================================================
+
+    def now_s(self):
+        return self.get_clock().now().nanoseconds * 1e-9
 
     def create_fallback_path(self):
         x_wp = np.array([0, 10, 20, 30, 40, 50, 60, 70, 80, 90], dtype=float)
         y_wp = np.array([0, 0, 0, 1, 3, 6, 8, 9, 9, 9], dtype=float)
         self.set_path_from_waypoints(x_wp, y_wp, source_name="fallback path")
 
+
+    def load_path_from_csv(self, filename):
+        try:
+            data = np.genfromtxt(
+                filename,
+                delimiter=",",
+                names=True,
+            )
+
+            x_wp = np.asarray(data["x"], dtype=float)
+            y_wp = np.asarray(data["y"], dtype=float)
+
+            keep = [0]
+            for i in range(1, len(x_wp)):
+                dx = x_wp[i] - x_wp[keep[-1]]
+                dy = y_wp[i] - y_wp[keep[-1]]
+                if np.hypot(dx, dy) > 1e-6:
+                    keep.append(i)
+
+            x_wp = x_wp[keep]
+            y_wp = y_wp[keep]
+
+            if len(x_wp) < 2:
+                raise RuntimeError("CSV path contains too few unique points.")
+
+            self.set_path_from_waypoints(
+                x_wp,
+                y_wp,
+                source_name=f"CSV path ({filename})",
+            )
+
+        except Exception as err:
+            self.get_logger().error(
+                f"Failed to load CSV path '{filename}': {err}"
+            )
+            self.get_logger().warn("Falling back to internal fallback path.")
+            self.create_fallback_path()
+
     def reset_solver_warm_start(self):
         if self.controller is not None:
-            self.controller.last_sol = None
-            self.controller.last_u0 = np.array([0.0], dtype=float)
+            self.controller.reset_warm_start()
 
     def set_path_from_waypoints(self, x_wp, y_wp, source_name="ROS path"):
         self.nmpc_path = SplinePath(x_wp, y_wp, ds=0.5)
@@ -123,36 +272,191 @@ class NMPCPathFollowerNode(Node):
         )
 
         self.last_s = 0.0
-        self.delta = 0.0
         self.last_valid_delta_ref = 0.0
+        self.nmpc_speed_ok = False
+        self.consecutive_failures = 0
         self.reset_solver_warm_start()
+        self.publish_path_visualization()
 
         self.get_logger().info(
             f"Loaded {source_name}: {len(x_wp)} waypoints, length={self.nmpc_path.length:.2f} m"
         )
 
+    # ============================================================
+    # Robustness helpers
+    # ============================================================
+
+    def stop_safely(self, reason):
+        self.get_logger().error(reason)
+        self.active = False
+        self.nmpc_speed_ok = False
+        self.publish_cmd(0.0, 0.0)
+        self.publish_status(False)
+        self.reset_solver_warm_start()
+
+    def data_is_fresh(self):
+        now = self.now_s()
+
+        # Gyro is intentionally not required. Yaw-rate has fallback logic.
+        required_times = [
+            self.last_pose_time,
+            self.last_vehicle_state_time,
+        ]
+
+        if any(t is None for t in required_times):
+            return False
+
+        return all((now - t) < self.max_data_age_s for t in required_times)
+
+    def gyro_is_fresh(self):
+        if self.last_gyro_time is None:
+            return False
+        return (self.now_s() - self.last_gyro_time) < self.max_data_age_s
+
+    def update_yaw_rate_fallback(self):
+        """
+        Priority:
+        1. Use /gnss/gyro if fresh.
+        2. Else use yaw derivative from gnss/pose.
+        3. Else use kinematic estimate vx/L*tan(delta).
+        Returns source code:
+            2.0 = gyro
+            1.0 = yaw derivative
+            0.0 = kinematic fallback
+        """
+        if self.gyro_valid and self.gyro_is_fresh():
+            return 2.0
+
+        if self.prev_yaw is not None and self.r_from_yaw is not None:
+            self.r = float(self.r_from_yaw)
+            return 1.0
+
+        self.r = float(self.vx / self.WHEELBASE * np.tan(self.delta))
+        return 0.0
+
+    def update_speed_gate(self):
+        if not self.nmpc_speed_ok and self.vx >= self.nmpc_enable_speed_mps:
+            self.nmpc_speed_ok = True
+            self.get_logger().info(
+                f"NMPC speed gate enabled at vx={self.vx:.2f} m/s."
+            )
+
+        if self.nmpc_speed_ok and self.vx <= self.nmpc_disable_speed_mps:
+            self.nmpc_speed_ok = False
+            self.reset_solver_warm_start()
+            self.get_logger().warn(
+                f"NMPC speed gate disabled at vx={self.vx:.2f} m/s."
+            )
+
+    def compute_soft_start_ramp(self):
+        if self.start_time is None:
+            return 0.0
+
+        elapsed = self.now_s() - self.start_time
+        return float(np.clip(elapsed / self.soft_start_duration, 0.0, 1.0))
+
+    # ============================================================
+    # Callbacks
+    # ============================================================
+
     def pose_callback(self, msg):
-        self.x = msg.pose.position.x
-        self.y = msg.pose.position.y
-        self.yaw = yaw_from_quaternion(msg.pose.orientation)
+        now = self.now_s()
+        new_yaw = yaw_from_quaternion(msg.pose.orientation)
 
-    def speed_callback(self, msg):
-        self.vx = max(float(msg.data) / 3.6, self.model_ctrl.vx_eps)
+        if self.yaw is not None and self.last_pose_time is not None:
+            dt = now - self.last_pose_time
+            if 1e-3 < dt < 1.0:
+                dyaw = wrap_angle(new_yaw - self.yaw)
+                self.r_from_yaw = float(dyaw / dt)
 
-    def steering_measurement_callback(self, msg):
-        steering_wheel_deg = float(msg.data)
+        self.prev_yaw = self.yaw
+        self.prev_yaw_time = self.last_pose_time
 
-        self.delta = -steering_wheel_deg * (30.0 / 460.0) * np.pi / 180.0
+        self.x = float(msg.pose.position.x)
+        self.y = float(msg.pose.position.y)
+        self.yaw = float(new_yaw)
 
-        self.delta = float(np.clip(
-            self.delta,
-            -self.MAX_STEERING_ANGLE,
-            self.MAX_STEERING_ANGLE,
-        ))
+        self.gnss_valid = True
+        self.last_pose_time = now
+
+    def gyro_callback(self, msg):
+        self.r = float(msg.vector.z)
+        self.gyro_valid = True
+        self.last_gyro_time = self.now_s()
+
+    def vehicle_state_callback(self, msg):
+        self.vx = max(float(msg.v_ego) / 3.6, 0.0)
+
+        new_delta = (
+            float(msg.steering_angle_deg)
+            * np.pi / 180.0
+            / self.STEERING_RATIO
+        )
+
+        now = self.now_s()
+
+        if self.prev_delta is not None and self.prev_delta_time is not None:
+            dt = now - self.prev_delta_time
+            if 1e-4 < dt < 1.0:
+                self.delta_rate = float((new_delta - self.prev_delta) / dt)
+
+        self.prev_delta = new_delta
+        self.prev_delta_time = now
+        self.delta = float(new_delta)
+
+        self.vehicle_state_valid = True
+        self.last_vehicle_state_time = now
+
+    def enable_callback(self, msg):
+        if not msg.data:
+            self.active = False
+            self.nmpc_speed_ok = False
+            self.publish_cmd(0.0, 0.0)
+            self.publish_status(False)
+            self.reset_solver_warm_start()
+            self.get_logger().info("Path following STOPPED.")
+            return
+
+        if not self.active:
+            if not self.gnss_valid:
+                self.get_logger().warn("Cannot start: no GNSS pose received.")
+                return
+
+            if not self.vehicle_state_valid:
+                self.get_logger().warn("Cannot start: no vehicle/state received.")
+                return
+
+            if self.nmpc_path is None or self.controller is None:
+                self.get_logger().warn("Cannot start: no valid path.")
+                return
+
+            if not self.gyro_valid:
+                self.get_logger().warn(
+                    "Starting without fresh /gnss/gyro. Yaw-rate fallback will be used."
+                )
+
+            self.active = True
+            self.last_s = 0.0
+            self.nmpc_speed_ok = False
+            self.consecutive_failures = 0
+            self.start_time = self.now_s()
+            self.reset_solver_warm_start()
+            self.publish_status(True)
+            self.get_logger().info("Path following STARTED.")
+            return
+
+        self.active = False
+        self.nmpc_speed_ok = False
+        self.publish_cmd(0.0, 0.0)
+        self.publish_status(False)
+        self.reset_solver_warm_start()
+        self.get_logger().info("Path following STOPPED by toggle.")
 
     def path_callback(self, msg):
+        if self.using_csv_path:
+            return
         if len(msg.poses) < 2:
-            self.get_logger().warn("Received /path with fewer than 2 poses. Ignoring.")
+            self.get_logger().warn("Received path with fewer than 2 poses. Ignoring.")
             return
 
         path_num_points = len(msg.poses)
@@ -162,10 +466,7 @@ class NMPCPathFollowerNode(Node):
         x_last = msg.poses[-1].pose.position.x
         y_last = msg.poses[-1].pose.position.y
 
-        path_length_estimate = np.hypot(
-            x_last - x_first,
-            y_last - y_first,
-        )
+        path_length_estimate = np.hypot(x_last - x_first, y_last - y_first)
 
         if (
             self.last_path_num_points == path_num_points
@@ -191,13 +492,17 @@ class NMPCPathFollowerNode(Node):
         y_wp = y_wp[keep]
 
         if len(x_wp) < 2:
-            self.get_logger().warn("Received /path only had duplicate points. Ignoring.")
+            self.get_logger().warn("Received path only had duplicate points. Ignoring.")
             return
 
         try:
-            self.set_path_from_waypoints(x_wp, y_wp, source_name="/path")
+            self.set_path_from_waypoints(x_wp, y_wp, source_name="path topic")
         except Exception as err:
-            self.get_logger().warn(f"Failed to build SplinePath from /path: {err}")
+            self.get_logger().warn(f"Failed to build SplinePath from path: {err}")
+
+    # ============================================================
+    # Geometry
+    # ============================================================
 
     def find_closest_s(self, x_car, y_car, last_s=None, search_radius=10.0):
         path = self.nmpc_path
@@ -232,11 +537,11 @@ class NMPCPathFollowerNode(Node):
         dx = x_car - x_ref
         dy = y_car - y_ref
 
-        ey = -dx * np.sin(psi_ref) + dy * np.cos(psi_ref)
-        epsi = wrap_angle(yaw - psi_ref)
+        ey = dx * np.sin(psi_ref) - dy * np.cos(psi_ref)
+        epsi = wrap_angle(psi_ref - yaw)
 
         return ey, epsi
-
+    
     def error_state_to_pose(self, ey, epsi, s):
         x_ref = self.nmpc_path.interp_x(s)
         y_ref = self.nmpc_path.interp_y(s)
@@ -248,25 +553,35 @@ class NMPCPathFollowerNode(Node):
 
         pose = PoseStamped()
         pose.header.stamp = self.get_clock().now().to_msg()
-        pose.header.frame_id = "map"
-
+        pose.header.frame_id = "utm32"
         pose.pose.position.x = float(x_global)
         pose.pose.position.y = float(y_global)
         pose.pose.position.z = 0.0
-
-        pose.pose.orientation.x = 0.0
-        pose.pose.orientation.y = 0.0
         pose.pose.orientation.z = float(np.sin(yaw_global / 2.0))
         pose.pose.orientation.w = float(np.cos(yaw_global / 2.0))
 
         return pose
 
-    def wheel_angle_to_steering_wheel_deg(self, delta_ref):
-        steering_wheel_angle_rad = (
-            self.MAX_STEERING_WHEEL_ANGLE / self.MAX_STEERING_ANGLE
-        ) * delta_ref
+    # ============================================================
+    # Actuator interface
+    # ============================================================
 
-        return float(np.rad2deg(steering_wheel_angle_rad))
+    def steering_ref_to_torque(self, delta_ref_next):
+        v_kmh = self.vx * 3.6
+
+        tau = float(np.interp(v_kmh, self.sched_v_kmh, self.sched_tau_r))
+        kss_sw_deg = float(np.interp(v_kmh, self.sched_v_kmh, self.sched_kss))
+
+        a = np.exp(-self.ctrl_par.dt / tau)
+
+        kss_front_rad = kss_sw_deg * np.pi / 180.0 / self.STEERING_RATIO
+        b = kss_front_rad * (1.0 - a)
+
+        if abs(b) < 1e-8:
+            return 0.0
+
+        torque = (delta_ref_next - a * self.delta) / b
+        return float(np.clip(torque, -self.torque_limit, self.torque_limit))
 
     def fallback_delta_ref(self):
         delta_dot_fallback = -self.delta / self.ctrl_par.dt
@@ -289,25 +604,53 @@ class NMPCPathFollowerNode(Node):
 
         return float(delta_ref)
 
-    def publish_outputs(self, delta_ref):
-        steering_msg = Float64()
-        steering_msg.data = self.wheel_angle_to_steering_wheel_deg(delta_ref)
-        self.steering_pub.publish(steering_msg)
+    # ============================================================
+    # Publish helpers
+    # ============================================================
 
-        speed_msg = Float64()
-        speed_msg.data = float(self.desired_speed_kmh)
-        self.speed_pub.publish(speed_msg)
+    def publish_cmd(self, accel_cmd, torque_cmd):
+        msg = Twist()
+        msg.linear.x = float(np.clip(accel_cmd, -1.0, 1.0))
+        msg.angular.z = float(np.clip(torque_cmd, -1.0, 1.0))
 
-        status_msg = Bool()
-        status_msg.data = True
-        self.status_pub.publish(status_msg)
+        # Always publish debug command.
+        self.debug_cmd_vel_pub.publish(msg)
 
-        return steering_msg.data
+        # Only publish to real car interface when explicitly enabled.
+        if self.publish_to_cmd_vel:
+            self.cmd_vel_pub.publish(msg)
+
+    def publish_status(self, active):
+        msg = Bool()
+        msg.data = bool(active)
+        self.status_pub.publish(msg)
+
+    def publish_path_visualization(self):
+        if self.nmpc_path is None:
+            return
+
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = "utm32"
+
+        for s in np.linspace(0.0, self.nmpc_path.length, 200):
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = float(self.nmpc_path.interp_x(s))
+            pose.pose.position.y = float(self.nmpc_path.interp_y(s))
+
+            yaw = self.nmpc_path.interp_psi(s)
+            pose.pose.orientation.z = float(np.sin(yaw / 2.0))
+            pose.pose.orientation.w = float(np.cos(yaw / 2.0))
+
+            path_msg.poses.append(pose)
+
+        self.path_vis_pub.publish(path_msg)
 
     def publish_prediction(self, X_opt, s_preview):
         pred_msg = Path()
         pred_msg.header.stamp = self.get_clock().now().to_msg()
-        pred_msg.header.frame_id = "map"
+        pred_msg.header.frame_id = "utm32"
 
         for k in range(X_opt.shape[0]):
             ey_k = float(X_opt[k, 0])
@@ -320,20 +663,72 @@ class NMPCPathFollowerNode(Node):
 
         self.pred_path_pub.publish(pred_msg)
 
-        if X_opt.shape[0] > 1:
-            ey_next = float(X_opt[1, 0])
-            epsi_next = float(X_opt[1, 1])
-            s_next = float(s_preview[min(1, len(s_preview) - 1)])
+    def publish_debug_topics(self, ey, epsi, delta_ref, torque_cmd, s_current, solve_time, yaw_rate_source):
+        cte_rory = ey
+        epsi_rory = epsi
 
-            next_pose = self.error_state_to_pose(ey_next, epsi_next, s_next)
-            self.next_pose_pub.publish(next_pose)
+        desired_delta_ff = np.arctan(self.veh_ctrl.L * self.nmpc_path.interp_kappa(s_current))
+
+        self.pub_cte.publish(make_float64(cte_rory))
+        self.pub_hdg_err.publish(make_float64(np.rad2deg(epsi_rory)))
+        self.pub_desired_delta.publish(make_float64(np.rad2deg(desired_delta_ff)))
+        self.pub_actual_delta.publish(make_float64(np.rad2deg(self.delta)))
+        self.pub_torque_cmd.publish(make_float64(torque_cmd))
+        self.pub_progress.publish(make_float64(s_current))
+
+        self.pub_lateral_error.publish(make_float64(cte_rory))
+        self.pub_heading_error.publish(make_float64(epsi_rory))
+
+        self.pub_solve_time.publish(make_float64(1000.0 * solve_time if np.isfinite(solve_time) else np.nan))
+
+        speed_gate_msg = Bool()
+        speed_gate_msg.data = bool(self.nmpc_speed_ok)
+        self.pub_speed_gate.publish(speed_gate_msg)
+
+        self.pub_yaw_rate_source.publish(make_float64(yaw_rate_source))
+
+        pf_msg = Twist()
+        pf_msg.linear.x = float(self.desired_speed_mps)
+        pf_msg.angular.z = float(desired_delta_ff)
+        self.pub_pf_cmd_vel.publish(pf_msg)
+
+    # ============================================================
+    # Main control loop
+    # ============================================================
 
     def control_loop(self):
+        if not self.active:
+            return
+
         if self.x is None or self.y is None or self.yaw is None:
             return
 
         if self.nmpc_path is None or self.controller is None:
-            self.get_logger().warn("No valid path/controller yet.")
+            self.stop_safely("No valid path/controller. Stopping.")
+            return
+
+        if not self.data_is_fresh():
+            self.stop_safely("Stale input data. Stopping NMPC.")
+            return
+
+        yaw_rate_source = self.update_yaw_rate_fallback()
+
+        self.update_speed_gate()
+
+        if not self.nmpc_speed_ok:
+            accel_cmd = self.kp_speed * (self.desired_speed_mps - self.vx)
+            accel_cmd = float(np.clip(accel_cmd, 0.0, 1.0))
+            self.publish_cmd(accel_cmd, 0.0)
+
+            speed_gate_msg = Bool()
+            speed_gate_msg.data = False
+            self.pub_speed_gate.publish(speed_gate_msg)
+            self.pub_yaw_rate_source.publish(make_float64(yaw_rate_source))
+
+            self.get_logger().warn(
+                f"NMPC held below speed threshold. vx={self.vx:.2f} m/s, "
+                f"enable at {self.nmpc_enable_speed_mps:.2f} m/s."
+            )
             return
 
         s_current_raw = self.find_closest_s(
@@ -357,20 +752,29 @@ class NMPCPathFollowerNode(Node):
 
         self.last_s = s_current
 
-        ey, epsi = self.compute_errors(
-            self.x,
-            self.y,
-            self.yaw,
-            s_current,
-        )
+        remaining = self.nmpc_path.length - s_current
+        if remaining < self.stop_distance:
+            self.get_logger().info("Reached end of path. Stopping.")
+            self.active = False
+            self.publish_cmd(0.0, 0.0)
+            self.publish_status(False)
+            return
 
-        x0 = np.array([
-            ey,
-            epsi,
-            self.vy,
-            self.r,
-            self.delta,
-        ], dtype=float)
+        ey_rory, epsi_rory = self.compute_errors(self.x, self.y, self.yaw, s_current)
+
+        ey_nmpc = -ey_rory
+        epsi_nmpc = -epsi_rory
+
+        x0 = np.array(
+            [
+                ey_nmpc,
+                epsi_nmpc,
+                self.vy,
+                self.r,
+                self.delta,
+            ],
+            dtype=float,
+        )
 
         s_preview, kappa_preview, vx_preview, ax_preview = preview_path_data(
             self.nmpc_path,
@@ -386,6 +790,8 @@ class NMPCPathFollowerNode(Node):
 
         delta_ref = self.delta
         solve_status = "NOT_SOLVED"
+        solve_time = np.nan
+        iter_count = np.nan
 
         try:
             X_opt, U_opt, solve_time, iter_count, status, soft_failure = self.controller.solve(
@@ -395,41 +801,79 @@ class NMPCPathFollowerNode(Node):
                 ax_preview,
             )
 
+            self.consecutive_failures = 0
             self.publish_prediction(X_opt, s_preview)
 
             delta_dot = float(U_opt[0, 0])
             delta_ref = self.delta + delta_dot * self.ctrl_par.dt
 
-            delta_ref = np.clip(
-                delta_ref,
-                -self.controller.delta_max,
-                self.controller.delta_max,
+            delta_ref = float(
+                np.clip(
+                    delta_ref,
+                    -self.controller.delta_max,
+                    self.controller.delta_max,
+                )
             )
 
-            delta_ref = float(delta_ref)
             self.last_valid_delta_ref = delta_ref
             solve_status = status
 
         except Exception as err:
+            self.consecutive_failures += 1
+
             self.get_logger().warn(
-                f"NMPC failed. Resetting warm start and using fallback steering. Error: {err}"
+                f"NMPC failed ({self.consecutive_failures}/"
+                f"{self.max_consecutive_failures}). Using fallback. Error: {err}"
             )
 
             self.reset_solver_warm_start()
+
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                self.stop_safely("Too many consecutive NMPC failures. Stopping vehicle.")
+                return
+
             delta_ref = self.fallback_delta_ref()
             solve_status = "FALLBACK"
 
-        steering_wheel_deg = self.publish_outputs(delta_ref)
+        torque_cmd = self.steering_ref_to_torque(delta_ref)
+
+        ramp = self.compute_soft_start_ramp()
+        torque_cmd *= ramp
+
+        accel_cmd = self.kp_speed * (self.desired_speed_mps - self.vx)
+        accel_cmd = float(np.clip(accel_cmd, -1.0, 1.0))
+
+        self.publish_cmd(accel_cmd, torque_cmd)
+        self.publish_debug_topics(
+            ey=ey_rory,
+            epsi=epsi_rory,
+            delta_ref=delta_ref,
+            torque_cmd=torque_cmd,
+            s_current=s_current,
+            solve_time=solve_time,
+            yaw_rate_source=yaw_rate_source,
+        )
+
+        source_name = {
+            2.0: "gyro",
+            1.0: "yaw_diff",
+            0.0: "kinematic",
+        }.get(yaw_rate_source, "unknown")
 
         self.get_logger().info(
-            f"s={s_current:.2f}, ey={ey:.3f}, "
-            f"epsi={np.rad2deg(epsi):.2f} deg, "
+            f"s={s_current:.2f}, ey={ey_rory:.3f}, "
+            f"epsi={np.rad2deg(epsi_rory):.2f} deg, "
             f"vx={self.vx:.2f} m/s, "
-            f"delta_meas={np.rad2deg(self.delta):.2f} deg, "
-            f"wheel_delta_ref={np.rad2deg(delta_ref):.2f} deg, "
-            f"steering_wheel_ref={steering_wheel_deg:.2f} deg, "
-            f"tire_model=dugoff, "
-            f"status={solve_status}"
+            f"vy={self.vy:.2f} m/s, "
+            f"r={self.r:.3f} rad/s ({source_name}), "
+            f"delta={np.rad2deg(self.delta):.2f} deg, "
+            f"delta_ref={np.rad2deg(delta_ref):.2f} deg, "
+            f"torque={torque_cmd:.3f}, "
+            f"ramp={ramp:.2f}, "
+            f"solve={1000.0 * solve_time:.1f} ms, "
+            f"iter={iter_count}, "
+            f"status={solve_status}, "
+            f"publish_to_cmd_vel={self.publish_to_cmd_vel}"
         )
 
 
