@@ -1,0 +1,1 @@
+NMPC Dugoff & Pacejka tire model & 0.035 & 1.015 & 1.48 & 30.00 & 90.00 & 3.86 & 0 \\

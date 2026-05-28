@@ -3,7 +3,15 @@ import numpy as np
 import casadi as ca
 import matplotlib.pyplot as plt
 from scipy.interpolate import CubicSpline
+from scipy.signal import savgol_filter
 from dataclasses import dataclass
+from pathlib import Path
+import csv
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import requests
+from shapely import wkt as shapely_wkt
+from shapely.geometry import LineString
 
 
 # ============================================================
@@ -43,6 +51,37 @@ def safe_nanpercentile(x, p):
     if len(x) == 0 or np.all(np.isnan(x)):
         return np.nan
     return np.nanpercentile(x, p)
+
+
+def smooth_signal(y, window=21, polyorder=3):
+    """
+    Smooth a signal for plotting only.
+
+    The raw logged signal is still saved unchanged. This function is only used
+    to make curvature plots visually consistent with the previous tests.
+    """
+    y = np.asarray(y, dtype=float)
+
+    if len(y) < 5:
+        return y.copy()
+
+    window = int(window)
+    if window % 2 == 0:
+        window += 1
+
+    window = min(window, len(y))
+    if window % 2 == 0:
+        window -= 1
+
+    if window <= polyorder:
+        window = polyorder + 2
+        if window % 2 == 0:
+            window += 1
+
+    if window > len(y) or window <= polyorder:
+        return y.copy()
+
+    return savgol_filter(y, window_length=window, polyorder=polyorder, mode="interp")
 
 
 # ============================================================
@@ -945,6 +984,541 @@ def print_csv_and_latex_rows(metrics):
     print(" & ".join(latex_values) + r" \\")
 
 
+
+
+# ============================================================
+# Result export
+# ============================================================
+
+def save_nmpc_nvdb_dugoff_pacejka_results(
+    out_dir,
+    scenario_info,
+    metrics,
+    path,
+    x_wp,
+    y_wp,
+    speed_profile,
+    t_log,
+    x_log,
+    y_log,
+    ey_log,
+    epsi_log,
+    vy_log,
+    r_log,
+    delta_log,
+    ddelta_log,
+    s_log,
+    vx_log,
+    ax_log,
+    kappa_log,
+    solve_time_log,
+    iter_log,
+    hard_fail_log,
+    soft_fail_log,
+    status_log,
+):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = {
+        **scenario_info,
+        **metrics,
+    }
+
+    csv_path = out_dir / "nmpc_nvdb_dugoff_pacejka_metrics.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary.keys()))
+        writer.writeheader()
+        writer.writerow(summary)
+
+    latex_row = (
+        f"{scenario_info['controller']} & "
+        f"{scenario_info['plant']} & "
+        f"{metrics['rms_ey_m']:.3f} & "
+        f"{metrics['max_abs_ey_m']:.3f} & "
+        f"{metrics['rms_epsi_deg']:.2f} & "
+        f"{metrics['max_abs_delta_deg']:.2f} & "
+        f"{metrics['max_abs_ddelta_deg_s']:.2f} & "
+        f"{metrics['avg_solve_ms']:.2f} & "
+        f"{metrics['hard_failures']} \\\\"
+    )
+    (out_dir / "nmpc_nvdb_dugoff_pacejka_latex_row.txt").write_text(latex_row + "\n")
+
+    np.savez(
+        out_dir / "nmpc_nvdb_dugoff_pacejka_logs.npz",
+        t_log=t_log,
+        x_log=x_log,
+        y_log=y_log,
+        ey_log=ey_log,
+        epsi_log=epsi_log,
+        vy_log=vy_log,
+        r_log=r_log,
+        delta_log=delta_log,
+        ddelta_log=ddelta_log,
+        s_log=s_log,
+        vx_log=vx_log,
+        ax_log=ax_log,
+        kappa_log=kappa_log,
+        kappa_plot=smooth_signal(kappa_log, window=21, polyorder=3),
+        solve_time_log=solve_time_log,
+        iter_log=iter_log,
+        hard_fail_log=hard_fail_log,
+        soft_fail_log=soft_fail_log,
+        status_log=np.asarray(status_log, dtype=object),
+        path_s=path.s,
+        path_x=path.x,
+        path_y=path.y,
+        path_kappa=path.kappa,
+        path_speed_profile=speed_profile,
+        x_wp=x_wp,
+        y_wp=y_wp,
+    )
+
+    plt.rcParams.update(
+        {
+            "font.size": 11,
+            "axes.titlesize": 12,
+            "axes.labelsize": 11,
+            "legend.fontsize": 10,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+        }
+    )
+
+    fig, ax = plt.subplots(figsize=(10.5, 6.8))
+    ax.plot(path.x, path.y, "--", linewidth=2.4, label="Reference path")
+    ax.plot(x_log, y_log, linewidth=2.2, label="Vehicle trajectory")
+    ax.scatter([x_log[0]], [y_log[0]], marker="o", s=70, label="Start")
+    ax.scatter([path.x[-1]], [path.y[-1]], marker="x", s=110, label="Goal")
+
+    x_all = np.concatenate([path.x, x_log])
+    y_all = np.concatenate([path.y, y_log])
+    x_range = np.max(x_all) - np.min(x_all)
+    y_range = np.max(y_all) - np.min(y_all)
+    x_margin = 0.04 * max(1.0, x_range)
+    y_margin = 0.08 * max(1.0, y_range)
+    ax.set_xlim(np.min(x_all) - x_margin, np.max(x_all) + x_margin)
+    ax.set_ylim(np.min(y_all) - y_margin, np.max(y_all) + y_margin)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True)
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_title("NMPC on NVDB route: Dugoff controller, Pacejka plant")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(out_dir / "nmpc_nvdb_dugoff_pacejka_trajectory.png", dpi=300)
+
+    fig, axs = plt.subplots(4, 1, figsize=(8.5, 9.5), sharex=True)
+    axs[0].plot(t_log, ey_log, linewidth=1.8)
+    axs[0].set_ylabel(r"$e_y$ [m]")
+    axs[0].grid(True)
+    axs[1].plot(t_log, np.rad2deg(epsi_log), linewidth=1.8)
+    axs[1].set_ylabel(r"$e_\psi$ [deg]")
+    axs[1].grid(True)
+    axs[2].plot(t_log, np.rad2deg(delta_log), linewidth=1.8)
+    axs[2].set_ylabel(r"$\delta$ [deg]")
+    axs[2].grid(True)
+    axs[3].plot(t_log, np.rad2deg(ddelta_log), linewidth=1.8)
+    axs[3].set_ylabel(r"$\dot{\delta}$ [deg/s]")
+    axs[3].set_xlabel("Time [s]")
+    axs[3].grid(True)
+    fig.suptitle("NMPC NVDB tracking errors and steering response")
+    fig.tight_layout()
+    fig.savefig(out_dir / "nmpc_nvdb_dugoff_pacejka_errors_steering.png", dpi=300)
+
+    kappa_plot = smooth_signal(kappa_log, window=21, polyorder=3)
+    r_ref = vx_log * kappa_plot
+    fig, axs = plt.subplots(3, 1, figsize=(8.5, 7.2), sharex=True)
+    axs[0].plot(t_log, kappa_plot, linewidth=1.8, label=r"Smoothed $\kappa$")
+    axs[0].set_ylabel(r"$\kappa$ [1/m]")
+    axs[0].grid(True)
+    axs[0].legend(loc="best")
+    axs[1].plot(t_log, vx_log, linewidth=1.8)
+    axs[1].set_ylabel(r"$v_x$ [m/s]")
+    axs[1].grid(True)
+    axs[2].plot(t_log, r_log, linewidth=1.8, label=r"$r$")
+    axs[2].plot(t_log, r_ref, "--", linewidth=1.8, label=r"$v_x \kappa$")
+    axs[2].set_ylabel("Yaw rate [rad/s]")
+    axs[2].set_xlabel("Time [s]")
+    axs[2].grid(True)
+    axs[2].legend(loc="best")
+    fig.suptitle("NMPC NVDB dynamic response")
+    fig.tight_layout()
+    fig.savefig(out_dir / "nmpc_nvdb_dugoff_pacejka_dynamic_response.png", dpi=300)
+
+    fig, axs = plt.subplots(3, 1, figsize=(8.5, 7.5), sharex=True)
+    axs[0].plot(t_log, 1000.0 * solve_time_log, linewidth=1.8, label="IPOPT solve time")
+    axs[0].axhline(1000.0 * scenario_info["dt_s"], linestyle="--", linewidth=1.5, label="Control period")
+    axs[0].set_ylabel("Solve time [ms]")
+    axs[0].grid(True)
+    axs[0].legend(loc="best")
+    axs[1].step(t_log, iter_log, where="post", linewidth=1.8)
+    axs[1].set_ylabel("IPOPT iterations")
+    axs[1].grid(True)
+    axs[2].step(t_log, soft_fail_log, where="post", linewidth=1.5, label="Soft warnings")
+    axs[2].step(t_log, hard_fail_log, where="post", linewidth=1.5, label="Hard failures")
+    axs[2].set_ylabel("Flag [-]")
+    axs[2].set_xlabel("Time [s]")
+    axs[2].set_ylim(-0.1, 1.1)
+    axs[2].grid(True)
+    axs[2].legend(loc="best")
+    fig.suptitle("NMPC NVDB solver performance")
+    fig.tight_layout()
+    fig.savefig(out_dir / "nmpc_nvdb_dugoff_pacejka_solver_performance.png", dpi=300)
+
+    plt.close("all")
+
+
+
+# ============================================================
+# NVDB route generation for the final demonstration simulation
+# ============================================================
+
+JsonDict = Dict[str, Any]
+
+NVDB_BASE_URL = "https://nvdbapiles.atlas.vegvesen.no"
+X_CLIENT = "ntnu-masteroppgave-nmpc"
+SRID = 5973
+
+NVDB_ROUTE_SEGMENTS = [
+    "3201 KV1548 K S1D1 m1-985",
+    "3201 KV1531 K S1D1 m551-1541",
+    "3201 KV1535 K S2D1 m1-619",
+]
+
+NVDB_ROUTE_REVERSE = [
+    True,   # desired direction: m985 -> m1
+    True,   # desired direction: m1541 -> m551
+    False,  # desired direction: m1 -> m619
+]
+
+NVDB_JOIN_TOLERANCE_M = 1.0
+NVDB_ROUTE_JOIN_MAX_DIST_M = 15.0
+NVDB_OVERLAP_TOLERANCE_M = 1.0
+NVDB_OVERLAP_RATIO_THRESHOLD = 0.7
+
+
+def nvdb_fetch_segments_for_reference(vegref: str) -> List[JsonDict]:
+    endpoint = f"{NVDB_BASE_URL}/vegnett/api/v4/veglenkesekvenser/segmentert"
+
+    headers = {
+        "X-Client": X_CLIENT,
+        "Accept": "application/json",
+    }
+
+    params: Dict[str, Any] = {
+        "srid": SRID,
+        "antall": 1000,
+        "inkluderAntall": "false",
+        "vegsystemreferanse": [vegref],
+    }
+
+    return nvdb_paginate(endpoint, headers=headers, params=params)
+
+
+def nvdb_paginate(
+    url: str,
+    headers: Dict[str, str],
+    params: Dict[str, Any],
+) -> List[JsonDict]:
+    out: List[JsonDict] = []
+    next_url: Optional[str] = url
+    first = True
+
+    for _ in range(200):
+        if next_url is None:
+            break
+
+        if first:
+            response = requests.get(
+                next_url,
+                headers=headers,
+                params=params,
+                timeout=(5.0, 30.0),
+            )
+            first = False
+        else:
+            response = requests.get(
+                next_url,
+                headers=headers,
+                timeout=(5.0, 30.0),
+            )
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"NVDB request failed for {url}: "
+                f"HTTP {response.status_code}, {response.text[:300]}"
+            )
+
+        data = response.json()
+
+        if isinstance(data, dict):
+            objects = data.get("objekter", [])
+            if isinstance(objects, list):
+                out.extend([obj for obj in objects if isinstance(obj, dict)])
+
+            next_url = None
+            metadata = data.get("metadata", {})
+            if isinstance(metadata, dict):
+                next_info = metadata.get("neste", {})
+                if isinstance(next_info, dict):
+                    href = next_info.get("href")
+                    if isinstance(href, str) and href and href != response.url:
+                        next_url = href
+
+        elif isinstance(data, list):
+            out.extend([obj for obj in data if isinstance(obj, dict)])
+            next_url = None
+        else:
+            next_url = None
+
+    print(f"NVDB: {len(out)} segments fetched.")
+    return out
+
+
+def nvdb_extract_wkt(segment: JsonDict) -> str:
+    geometry = segment.get("geometri")
+    if isinstance(geometry, dict):
+        wkt_str = geometry.get("wkt")
+        return wkt_str if isinstance(wkt_str, str) else ""
+    if isinstance(geometry, str):
+        return geometry
+    return ""
+
+
+def nvdb_wkt_to_xy(wkt_str: str) -> Optional[np.ndarray]:
+    try:
+        geometry = shapely_wkt.loads(wkt_str)
+    except Exception:
+        return None
+
+    if not hasattr(geometry, "coords"):
+        return None
+
+    coords = np.asarray(list(geometry.coords), dtype=float)
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        return None
+
+    return coords[:, :2].copy()
+
+
+def nvdb_segment_sort_key(segment: JsonDict) -> float:
+    vsr = segment.get("vegsystemreferanse", {})
+    if isinstance(vsr, dict):
+        strekning = vsr.get("strekning", {})
+        if isinstance(strekning, dict):
+            fra_meter = strekning.get("fra_meter")
+            til_meter = strekning.get("til_meter")
+            if isinstance(fra_meter, (int, float)) and isinstance(til_meter, (int, float)):
+                return float(min(fra_meter, til_meter))
+
+    startposisjon = segment.get("startposisjon")
+    if isinstance(startposisjon, (int, float)):
+        return float(startposisjon)
+
+    return 0.0
+
+
+def nvdb_remove_duplicate_neighbors(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    if points.shape[0] < 2:
+        return points
+
+    distances = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    keep = np.hstack(([True], distances > eps))
+    return points[keep]
+
+
+def nvdb_polyline_length(points: np.ndarray) -> float:
+    if points.shape[0] < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
+
+
+def nvdb_parse_segments_to_polylines(
+    segments: Sequence[JsonDict],
+) -> List[Tuple[float, np.ndarray]]:
+    polylines: List[Tuple[float, np.ndarray]] = []
+
+    for segment in segments:
+        wkt_str = nvdb_extract_wkt(segment)
+        if not wkt_str:
+            continue
+
+        points = nvdb_wkt_to_xy(wkt_str)
+        if points is None or points.shape[0] < 2:
+            continue
+
+        points = nvdb_remove_duplicate_neighbors(points)
+        if points.shape[0] < 2:
+            continue
+
+        polylines.append((nvdb_segment_sort_key(segment), points))
+
+    return sorted(polylines, key=lambda item: item[0])
+
+
+def nvdb_are_polylines_overlapping(
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+    overlap_tol: float = NVDB_OVERLAP_TOLERANCE_M,
+    overlap_ratio_thresh: float = NVDB_OVERLAP_RATIO_THRESHOLD,
+) -> bool:
+    if points_a.shape[0] < 2 or points_b.shape[0] < 2:
+        return False
+
+    line_a = LineString(points_a)
+    line_b = LineString(points_b)
+
+    if line_a.length <= 1e-6 or line_b.length <= 1e-6:
+        return False
+
+    inter_len = line_a.buffer(overlap_tol, cap_style=2).intersection(line_b).length
+    min_len = min(line_a.length, line_b.length)
+    return inter_len / min_len >= overlap_ratio_thresh
+
+
+def nvdb_filter_overlapping_polylines(
+    polylines: Sequence[Tuple[float, np.ndarray]],
+) -> List[Tuple[float, np.ndarray]]:
+    kept: List[Tuple[float, np.ndarray]] = []
+
+    for sort_key, points in polylines:
+        duplicate = False
+        for _, kept_points in kept:
+            if nvdb_are_polylines_overlapping(points, kept_points):
+                duplicate = True
+                break
+
+        if not duplicate:
+            kept.append((sort_key, points))
+
+    return kept
+
+
+def nvdb_sort_and_merge_polylines(
+    polylines: Sequence[Tuple[float, np.ndarray]],
+    join_tol: float = NVDB_JOIN_TOLERANCE_M,
+) -> np.ndarray:
+    polylines = nvdb_filter_overlapping_polylines(polylines)
+
+    if not polylines:
+        return np.zeros((0, 2), dtype=float)
+
+    merged = polylines[0][1].copy()
+
+    for _, candidate in polylines[1:]:
+        current_end = merged[-1]
+
+        d_start = np.linalg.norm(candidate[0] - current_end)
+        d_end = np.linalg.norm(candidate[-1] - current_end)
+
+        if d_end < d_start:
+            candidate = candidate[::-1].copy()
+            join_dist = d_end
+        else:
+            join_dist = d_start
+
+        if join_dist > join_tol:
+            print(f"Warning: local segment join distance = {join_dist:.2f} m")
+
+        if np.allclose(merged[-1], candidate[0], atol=1e-6):
+            merged = np.vstack((merged, candidate[1:]))
+        else:
+            merged = np.vstack((merged, candidate))
+
+    return nvdb_remove_duplicate_neighbors(merged)
+
+
+def nvdb_build_polyline_for_reference(vegref: str) -> np.ndarray:
+    segments = nvdb_fetch_segments_for_reference(vegref)
+    polylines = nvdb_parse_segments_to_polylines(segments)
+
+    if not polylines:
+        raise RuntimeError(f"No valid geometry found for {vegref}")
+
+    merged = nvdb_sort_and_merge_polylines(polylines)
+
+    if merged.shape[0] < 2:
+        raise RuntimeError(f"Too few points after merge for {vegref}")
+
+    return merged
+
+
+def nvdb_stitch_route_parts(
+    route_parts: Sequence[np.ndarray],
+    route_reverse: Sequence[bool],
+) -> np.ndarray:
+    oriented_parts: List[np.ndarray] = []
+
+    for points, reverse in zip(route_parts, route_reverse):
+        oriented_parts.append(points[::-1].copy() if reverse else points.copy())
+
+    full = oriented_parts[0]
+
+    for i, part in enumerate(oriented_parts[1:], start=2):
+        d_start = np.linalg.norm(part[0] - full[-1])
+        d_end = np.linalg.norm(part[-1] - full[-1])
+
+        if d_end < d_start:
+            part = part[::-1].copy()
+            join_dist = d_end
+        else:
+            join_dist = d_start
+
+        print(f"Route join distance to part {i}: {join_dist:.2f} m")
+
+        if join_dist > NVDB_ROUTE_JOIN_MAX_DIST_M:
+            print(
+                f"Warning: route join distance is large ({join_dist:.2f} m). "
+                "Check route order and reverse flags."
+            )
+
+        if np.allclose(full[-1], part[0], atol=1e-6):
+            full = np.vstack((full, part[1:]))
+        else:
+            full = np.vstack((full, part))
+
+    return nvdb_remove_duplicate_neighbors(full)
+
+
+def create_nvdb_hosle_waypoints(max_length_m: Optional[float] = None):
+    """
+    Builds the Hosle Skole NVDB route and returns local x/y waypoints.
+    If max_length_m is set, only the first part of the route is used.
+    """
+    route_parts = []
+
+    for vegref in NVDB_ROUTE_SEGMENTS:
+        print(f"\nFetching NVDB segment: {vegref}")
+        part = nvdb_build_polyline_for_reference(vegref)
+        print(f"  points: {part.shape[0]}, length: {nvdb_polyline_length(part):.1f} m")
+        route_parts.append(part)
+
+    route_global = nvdb_stitch_route_parts(route_parts, NVDB_ROUTE_REVERSE)
+
+    if route_global.shape[0] < 3:
+        raise RuntimeError("Too few points in stitched NVDB route.")
+
+    # Convert from projected global coordinates to a local metric frame.
+    origin = route_global[0].copy()
+    route_local = route_global - origin
+
+    if max_length_m is not None:
+        s_raw = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(route_local, axis=0), axis=1))))
+        keep = s_raw <= float(max_length_m)
+        if np.sum(keep) < 3:
+            raise RuntimeError("NVDB crop length leaves too few points.")
+        route_local = route_local[keep]
+
+    route_local = nvdb_remove_duplicate_neighbors(route_local)
+
+    print(f"\nNVDB route built:")
+    print(f"  raw/local points: {route_local.shape[0]}")
+    print(f"  approximate length: {nvdb_polyline_length(route_local):.1f} m")
+
+    return route_local[:, 0], route_local[:, 1]
+
+
 # ============================================================
 # Test paths
 # ============================================================
@@ -956,8 +1530,8 @@ def create_mild_waypoints():
 
 
 def create_sharp_waypoints():
-    x = np.array([0, 10, 20, 30, 40, 50, 55, 60, 65, 75, 90, 110], dtype=float)
-    y = np.array([0,  0,  0,  2,  8, 18, 28, 35, 38, 36, 30, 25], dtype=float)
+    x_wp = np.array([0, 10, 20, 30, 40, 50, 55, 60, 65, 75, 90, 110], dtype=float)
+    y_wp = np.array([0,  0,  0,  2,  8, 18, 28, 35, 38, 36, 30, 25], dtype=float)
     return x_wp, y_wp
 
 # ============================================================
@@ -966,10 +1540,10 @@ def create_sharp_waypoints():
 
 def main():
 
-    tire_model_ctrl = "dugoff"       # "linear" or "dugoff"
-    tire_model_plant = "dugoff"     # "linear", "dugoff", or "pacejka"
-
-    use_mild_path = False
+    # Final NVDB demonstration simulation:
+    # Dugoff tire model in the NMPC controller, simplified Pacejka in the plant.
+    tire_model_ctrl = "dugoff"
+    tire_model_plant = "pacejka"
 
     stiffness_scale_ctrl = 1.00
     stiffness_scale_plant = 1.00
@@ -978,8 +1552,15 @@ def main():
     mu_plant = 0.80
 
     ctrl_par = ControllerParams()
-    sim_par = SimulationParams()
-    speed_par = SpeedProfileParams()
+    sim_par = SimulationParams(dt=0.1, sim_time=50.0)
+
+    # Use the same speed-profile logic as for the NVDB path-quality plots.
+    speed_par = SpeedProfileParams(
+        vx_nominal=7.0,
+        vx_min=2.0,
+        vx_max=7.0,
+        ay_max=1.8,
+    )
 
     model_ctrl = ModelParams(tire_model=tire_model_ctrl)
     model_plant = ModelParams(tire_model=tire_model_plant)
@@ -1004,21 +1585,19 @@ def main():
         mu=mu_plant
     )
  
-    if use_mild_path:
-        path_name = "mild"
-        x_wp, y_wp = create_mild_waypoints()
-    else:
-        path_name = "sharp"
-        x_wp, y_wp = create_sharp_waypoints()
+    path_name = "nvdb_hosle"
+
+    # Set max_length_m=None to simulate the full 2.6 km route.
+    # For a faster debug run, use e.g. max_length_m=600.0.
+    x_wp, y_wp = create_nvdb_hosle_waypoints(max_length_m=None)
 
     path = SplinePath(x_wp, y_wp, ds=0.5)
 
     speed_profile = build_curvature_aware_speed_profile(path, speed_par)
+    ax_profile = build_longitudinal_acc_profile(path, speed_profile)
 
-    ax_profile = np.zeros_like(speed_profile)
-
-    # Later test:
-    # ax_profile = build_longitudinal_acc_profile(path, speed_profile)
+    # Make sure the maximum simulation time is long enough for the full route.
+    sim_par.sim_time = max(sim_par.sim_time, path.length / max(speed_par.vx_nominal, 0.5) + 30.0)
 
     controller = NMPCController(path, veh_ctrl, ctrl_par, model_ctrl)
 
@@ -1188,81 +1767,71 @@ def main():
     print(f"N:                          {ctrl_par.N}")
     print(f"dt:                         {ctrl_par.dt:.3f} s")
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(path.x, path.y, "--", label="Reference path")
-    plt.plot(x_log, y_log, label="Vehicle path")
-    plt.plot(x_wp, y_wp, "o", alpha=0.5, label="Waypoints")
-    plt.axis("equal")
-    plt.xlabel("x [m]")
-    plt.ylabel("y [m]")
-    plt.title(f"NMPC path following")
-    plt.grid(True)
-    plt.legend()
+    scenario_info = {
+        "scenario": "nmpc_nvdb_dugoff_pacejka_hosle_7ms",
+        "controller": "NMPC Dugoff",
+        "plant": "Pacejka tire model",
+        "path": path_name,
+        "vx_nominal_m_s": speed_par.vx_nominal,
+        "vx_min_m_s": speed_par.vx_min,
+        "vx_max_m_s": speed_par.vx_max,
+        "ay_max_m_s2": speed_par.ay_max,
+        "initial_cross_track_error_m": 1.0,
+        "initial_heading_error_deg": 2.0,
+        "path_length_m": path.length,
+        "max_abs_kappa_1_m": float(np.max(np.abs(path.kappa))),
+        "dt_s": sim_par.dt,
+        "N": ctrl_par.N,
+        "tire_model_ctrl": model_ctrl.tire_model,
+        "tire_model_plant": model_plant.tire_model,
+        "mu_ctrl": veh_ctrl.mu,
+        "mu_plant": veh_plant.mu,
+        "stiffness_scale_ctrl": stiffness_scale_ctrl,
+        "stiffness_scale_plant": stiffness_scale_plant,
+        "pacejka_Bf_1_deg": model_plant.pacejka_Bf,
+        "pacejka_Cf_shape": model_plant.pacejka_Cf_shape,
+        "pacejka_Df_N": model_plant.pacejka_Df,
+        "pacejka_Ef": model_plant.pacejka_Ef,
+        "pacejka_Br_1_deg": model_plant.pacejka_Br,
+        "pacejka_Cr_shape": model_plant.pacejka_Cr_shape,
+        "pacejka_Dr_N": model_plant.pacejka_Dr,
+        "pacejka_Er": model_plant.pacejka_Er,
+    }
 
-    fig, axs = plt.subplots(4, 2, figsize=(14, 14))
-    axs = axs.ravel()
+    out_dir = "results_nmpc_nvdb_dugoff_pacejka"
 
-    axs[0].plot(path.s, speed_profile)
-    axs[0].set_title("Curvature-aware speed profile")
-    axs[0].set_xlabel("s [m]")
-    axs[0].set_ylabel("v_x [m/s]")
-    axs[0].grid(True)
+    save_nmpc_nvdb_dugoff_pacejka_results(
+        out_dir=out_dir,
+        scenario_info=scenario_info,
+        metrics=metrics,
+        path=path,
+        x_wp=x_wp,
+        y_wp=y_wp,
+        speed_profile=speed_profile,
+        t_log=t_log,
+        x_log=x_log,
+        y_log=y_log,
+        ey_log=ey_log,
+        epsi_log=epsi_log,
+        vy_log=vy_log,
+        r_log=r_log,
+        delta_log=delta_log,
+        ddelta_log=ddelta_log,
+        s_log=s_log,
+        vx_log=vx_log,
+        ax_log=ax_log,
+        kappa_log=kappa_log,
+        solve_time_log=solve_time_log,
+        iter_log=iter_log,
+        hard_fail_log=hard_fail_log,
+        soft_fail_log=soft_fail_log,
+        status_log=status_log,
+    )
 
-    axs[1].plot(t_log, ey_log)
-    axs[1].set_title("Cross-track error")
-    axs[1].set_xlabel("Time [s]")
-    axs[1].set_ylabel("e_y [m]")
-    axs[1].grid(True)
-
-    axs[2].plot(t_log, np.rad2deg(epsi_log))
-    axs[2].set_title("Heading error")
-    axs[2].set_xlabel("Time [s]")
-    axs[2].set_ylabel("e_psi [deg]")
-    axs[2].grid(True)
-
-    axs[3].plot(t_log, np.rad2deg(delta_log), label="delta")
-    axs[3].plot(t_log, np.rad2deg(ddelta_log), label="delta_dot")
-    axs[3].set_title("Steering states")
-    axs[3].set_xlabel("Time [s]")
-    axs[3].set_ylabel("[deg], [deg/s]")
-    axs[3].legend()
-    axs[3].grid(True)
-
-    axs[4].plot(t_log, vy_log, label="v_y")
-    axs[4].plot(t_log, r_log, label="r")
-    axs[4].set_title("Dynamic states")
-    axs[4].set_xlabel("Time [s]")
-    axs[4].set_ylabel("[m/s], [rad/s]")
-    axs[4].legend()
-    axs[4].grid(True)
-
-    axs[5].plot(t_log, vx_log, label="v_x")
-    axs[5].plot(t_log, s_log, label="s")
-    axs[5].set_title("Speed and path progress")
-    axs[5].set_xlabel("Time [s]")
-    axs[5].set_ylabel("v_x [m/s], s [m]")
-    axs[5].legend()
-    axs[5].grid(True)
-
-    if np.any(~np.isnan(solve_time_log)):
-        axs[6].plot(t_log, 1000.0 * solve_time_log, label="Solve time")
-    axs[6].set_title("NMPC solve time")
-    axs[6].set_xlabel("Time [s]")
-    axs[6].set_ylabel("Solve time [ms]")
-    axs[6].legend()
-    axs[6].grid(True)
-
-    axs[7].plot(t_log, soft_fail_log, drawstyle="steps-post", label="Soft warning")
-    axs[7].plot(t_log, hard_fail_log, drawstyle="steps-post", label="Hard failure")
-    axs[7].set_title("Solver warnings and failures")
-    axs[7].set_xlabel("Time [s]")
-    axs[7].set_ylabel("Flag [-]")
-    axs[7].set_ylim(-0.1, 1.1)
-    axs[7].legend()
-    axs[7].grid(True)
-
-    fig.tight_layout()
-    plt.show()
+    print("\n=== NVDB Dugoff/Pacejka simulation completed ===")
+    print(f"Output directory: {out_dir}")
+    print("\nLaTeX table row:")
+    print((Path(out_dir) / "nmpc_nvdb_dugoff_pacejka_latex_row.txt").read_text().strip())
 
 
 if __name__ == "__main__":

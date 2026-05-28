@@ -1,0 +1,3 @@
+path,length_m,mean_abs_kappa_1pm,p95_abs_kappa_1pm,max_abs_kappa_1pm,min_speed_mps,mean_speed_mps,max_speed_mps
+Mild path,90.5525,0.00344468,0.00546362,0.00549513,7,7,7
+Sharp path,128.585,0.0239106,0.082099,0.136922,3.62577,6.7429,7

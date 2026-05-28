@@ -1,0 +1,8 @@
+metric,value
+path_length_m,2637.9825
+mean_abs_kappa_1pm,0.0089535046
+p95_abs_kappa_1pm,0.028057121
+max_abs_kappa_1pm,0.26753721
+min_speed_mps,2.5938458
+max_speed_mps,7
+mean_speed_mps,6.9611749

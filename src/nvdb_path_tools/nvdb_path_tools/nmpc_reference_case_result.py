@@ -3,7 +3,10 @@ import numpy as np
 import casadi as ca
 import matplotlib.pyplot as plt
 from scipy.interpolate import CubicSpline
+from scipy.signal import savgol_filter
 from dataclasses import dataclass
+from pathlib import Path
+import csv
 
 
 # ============================================================
@@ -43,6 +46,37 @@ def safe_nanpercentile(x, p):
     if len(x) == 0 or np.all(np.isnan(x)):
         return np.nan
     return np.nanpercentile(x, p)
+
+
+def smooth_signal(y, window=21, polyorder=3):
+    """
+    Smooth a signal for plotting only.
+
+    The raw logged signal is still saved unchanged. This function is only used
+    to make the curvature subplot visually consistent with the previous tests.
+    """
+    y = np.asarray(y, dtype=float)
+
+    if len(y) < 5:
+        return y.copy()
+
+    window = int(window)
+    if window % 2 == 0:
+        window += 1
+
+    window = min(window, len(y))
+    if window % 2 == 0:
+        window -= 1
+
+    if window <= polyorder:
+        window = polyorder + 2
+        if window % 2 == 0:
+            window += 1
+
+    if window > len(y) or window <= polyorder:
+        return y.copy()
+
+    return savgol_filter(y, window_length=window, polyorder=polyorder, mode="interp")
 
 
 # ============================================================
@@ -956,9 +990,197 @@ def create_mild_waypoints():
 
 
 def create_sharp_waypoints():
-    x = np.array([0, 10, 20, 30, 40, 50, 55, 60, 65, 75, 90, 110], dtype=float)
-    y = np.array([0,  0,  0,  2,  8, 18, 28, 35, 38, 36, 30, 25], dtype=float)
+    x_wp = np.array([0, 10, 20, 30, 40, 50, 55, 60, 65, 75, 90, 110], dtype=float)
+    y_wp = np.array([0,  0,  0,  2,  8, 18, 28, 35, 38, 36, 30, 25], dtype=float)
     return x_wp, y_wp
+
+
+# ============================================================
+# Result export
+# ============================================================
+
+def save_nmpc_reference_results(
+    out_dir,
+    scenario_info,
+    metrics,
+    path,
+    x_wp,
+    y_wp,
+    speed_profile,
+    t_log,
+    x_log,
+    y_log,
+    ey_log,
+    epsi_log,
+    vy_log,
+    r_log,
+    delta_log,
+    ddelta_log,
+    s_log,
+    vx_log,
+    ax_log,
+    kappa_log,
+    solve_time_log,
+    iter_log,
+    hard_fail_log,
+    soft_fail_log,
+    status_log,
+):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = {
+        **scenario_info,
+        **metrics,
+    }
+
+    csv_path = out_dir / "nmpc_reference_metrics.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary.keys()))
+        writer.writeheader()
+        writer.writerow(summary)
+
+    latex_row = (
+        f"{scenario_info['controller']} & "
+        f"{scenario_info['plant']} & "
+        f"{metrics['rms_ey_m']:.3f} & "
+        f"{metrics['max_abs_ey_m']:.3f} & "
+        f"{metrics['rms_epsi_deg']:.2f} & "
+        f"{metrics['max_abs_delta_deg']:.2f} & "
+        f"{metrics['max_abs_ddelta_deg_s']:.2f} & "
+        f"{metrics['avg_solve_ms']:.2f} & "
+        f"{metrics['hard_failures']} \\\\"
+    )
+    (out_dir / "nmpc_reference_latex_row.txt").write_text(latex_row + "\n")
+
+    np.savez(
+        out_dir / "nmpc_reference_logs.npz",
+        t_log=t_log,
+        x_log=x_log,
+        y_log=y_log,
+        ey_log=ey_log,
+        epsi_log=epsi_log,
+        vy_log=vy_log,
+        r_log=r_log,
+        delta_log=delta_log,
+        ddelta_log=ddelta_log,
+        s_log=s_log,
+        vx_log=vx_log,
+        ax_log=ax_log,
+        kappa_log=kappa_log,
+        kappa_plot=smooth_signal(kappa_log, window=21, polyorder=3),
+        solve_time_log=solve_time_log,
+        iter_log=iter_log,
+        hard_fail_log=hard_fail_log,
+        soft_fail_log=soft_fail_log,
+        status_log=np.asarray(status_log, dtype=object),
+        path_s=path.s,
+        path_x=path.x,
+        path_y=path.y,
+        path_kappa=path.kappa,
+        path_speed_profile=speed_profile,
+        x_wp=x_wp,
+        y_wp=y_wp,
+    )
+
+    plt.rcParams.update(
+        {
+            "font.size": 11,
+            "axes.titlesize": 12,
+            "axes.labelsize": 11,
+            "legend.fontsize": 10,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+        }
+    )
+
+    fig, ax = plt.subplots(figsize=(10.5, 6.8))
+    ax.plot(path.x, path.y, "--", linewidth=2.4, label="Reference path")
+    ax.plot(x_log, y_log, linewidth=2.2, label="Vehicle trajectory")
+    ax.scatter([x_log[0]], [y_log[0]], marker="o", s=70, label="Start")
+    ax.scatter([path.x[-1]], [path.y[-1]], marker="x", s=110, label="Goal")
+
+    x_all = np.concatenate([path.x, x_log])
+    y_all = np.concatenate([path.y, y_log])
+    x_range = np.max(x_all) - np.min(x_all)
+    y_range = np.max(y_all) - np.min(y_all)
+    x_margin = 0.04 * max(1.0, x_range)
+    y_margin = 0.80 * max(1.0, y_range)
+    ax.set_xlim(np.min(x_all) - x_margin, np.max(x_all) + x_margin)
+    ax.set_ylim(np.min(y_all) - y_margin, np.max(y_all) + y_margin)
+    # Keep the visual style consistent with the previous result plots.
+    # Do not force equal aspect, since the path is long relative to lateral variation.
+    ax.set_aspect("auto")
+    ax.grid(True)
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_title("NMPC Dugoff trajectory on sharp path")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(out_dir / "nmpc_dugoff_trajectory.png", dpi=300)
+
+    fig, axs = plt.subplots(4, 1, figsize=(8.5, 9.5), sharex=True)
+    axs[0].plot(t_log, ey_log, linewidth=1.8)
+    axs[0].set_ylabel(r"$e_y$ [m]")
+    axs[0].grid(True)
+    axs[1].plot(t_log, np.rad2deg(epsi_log), linewidth=1.8)
+    axs[1].set_ylabel(r"$e_\psi$ [deg]")
+    axs[1].grid(True)
+    axs[2].plot(t_log, np.rad2deg(delta_log), linewidth=1.8)
+    axs[2].set_ylabel(r"$\delta$ [deg]")
+    axs[2].grid(True)
+    axs[3].plot(t_log, np.rad2deg(ddelta_log), linewidth=1.8)
+    axs[3].set_ylabel(r"$\dot{\delta}$ [deg/s]")
+    axs[3].set_xlabel("Time [s]")
+    axs[3].grid(True)
+    fig.suptitle("NMPC Dugoff tracking errors and steering response")
+    fig.tight_layout()
+    fig.savefig(out_dir / "nmpc_dugoff_errors_steering.png", dpi=300)
+
+    # Smooth curvature for plotting only. Raw kappa_log is still saved in the logs. window=21, polyorder=3)
+    # Smooth curvature for plotting only. Raw kappa_log is still saved in the logs.
+    kappa_plot = smooth_signal(kappa_log, window=21, polyorder=3)
+    r_ref = vx_log * kappa_plot
+    fig, axs = plt.subplots(3, 1, figsize=(8.5, 7.2), sharex=True)
+    axs[0].plot(t_log, kappa_plot, linewidth=1.8, label=r"Smoothed $\kappa$")
+    axs[0].set_ylabel(r"$\kappa$ [1/m]")
+    axs[0].grid(True)
+    axs[0].legend(loc="best")
+    axs[1].plot(t_log, vx_log, linewidth=1.8)
+    axs[1].set_ylabel(r"$v_x$ [m/s]")
+    axs[1].grid(True)
+    axs[2].plot(t_log, r_log, linewidth=1.8, label=r"$r$")
+    axs[2].plot(t_log, r_ref, "--", linewidth=1.8, label=r"$v_x \kappa$")
+    axs[2].set_ylabel("Yaw rate [rad/s]")
+    axs[2].set_xlabel("Time [s]")
+    axs[2].grid(True)
+    axs[2].legend(loc="best")
+    fig.suptitle("NMPC Dugoff dynamic response")
+    fig.tight_layout()
+    fig.savefig(out_dir / "nmpc_dugoff_dynamic_response.png", dpi=300)
+
+    fig, axs = plt.subplots(3, 1, figsize=(8.5, 7.5), sharex=True)
+    axs[0].plot(t_log, 1000.0 * solve_time_log, linewidth=1.8, label="IPOPT solve time")
+    axs[0].axhline(1000.0 * scenario_info["dt_s"], linestyle="--", linewidth=1.5, label="Control period")
+    axs[0].set_ylabel("Solve time [ms]")
+    axs[0].grid(True)
+    axs[0].legend(loc="best")
+    axs[1].step(t_log, iter_log, where="post", linewidth=1.8)
+    axs[1].set_ylabel("IPOPT iterations")
+    axs[1].grid(True)
+    axs[2].step(t_log, soft_fail_log, where="post", linewidth=1.5, label="Soft warnings")
+    axs[2].step(t_log, hard_fail_log, where="post", linewidth=1.5, label="Hard failures")
+    axs[2].set_ylabel("Flag [-]")
+    axs[2].set_xlabel("Time [s]")
+    axs[2].set_ylim(-0.1, 1.1)
+    axs[2].grid(True)
+    axs[2].legend(loc="best")
+    fig.suptitle("NMPC Dugoff solver performance")
+    fig.tight_layout()
+    fig.savefig(out_dir / "nmpc_dugoff_solver_performance.png", dpi=300)
+
+    plt.close("all")
+
 
 # ============================================================
 # Main
@@ -1188,81 +1410,58 @@ def main():
     print(f"N:                          {ctrl_par.N}")
     print(f"dt:                         {ctrl_par.dt:.3f} s")
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(path.x, path.y, "--", label="Reference path")
-    plt.plot(x_log, y_log, label="Vehicle path")
-    plt.plot(x_wp, y_wp, "o", alpha=0.5, label="Waypoints")
-    plt.axis("equal")
-    plt.xlabel("x [m]")
-    plt.ylabel("y [m]")
-    plt.title(f"NMPC path following")
-    plt.grid(True)
-    plt.legend()
+    scenario_info = {
+        "scenario": "nmpc_dugoff_reference_sharp_7ms",
+        "controller": "NMPC Dugoff",
+        "plant": "Dugoff tire model",
+        "path": path_name,
+        "vx_nominal_m_s": speed_par.vx_nominal,
+        "initial_cross_track_error_m": 1.0,
+        "initial_heading_error_deg": 2.0,
+        "path_length_m": path.length,
+        "max_abs_kappa_1_m": float(np.max(np.abs(path.kappa))),
+        "dt_s": sim_par.dt,
+        "N": ctrl_par.N,
+        "tire_model_ctrl": model_ctrl.tire_model,
+        "tire_model_plant": model_plant.tire_model,
+        "mu_ctrl": veh_ctrl.mu,
+        "mu_plant": veh_plant.mu,
+        "stiffness_scale_ctrl": stiffness_scale_ctrl,
+        "stiffness_scale_plant": stiffness_scale_plant,
+    }
 
-    fig, axs = plt.subplots(4, 2, figsize=(14, 14))
-    axs = axs.ravel()
+    save_nmpc_reference_results(
+        out_dir="results_nmpc_reference_case",
+        scenario_info=scenario_info,
+        metrics=metrics,
+        path=path,
+        x_wp=x_wp,
+        y_wp=y_wp,
+        speed_profile=speed_profile,
+        t_log=t_log,
+        x_log=x_log,
+        y_log=y_log,
+        ey_log=ey_log,
+        epsi_log=epsi_log,
+        vy_log=vy_log,
+        r_log=r_log,
+        delta_log=delta_log,
+        ddelta_log=ddelta_log,
+        s_log=s_log,
+        vx_log=vx_log,
+        ax_log=ax_log,
+        kappa_log=kappa_log,
+        solve_time_log=solve_time_log,
+        iter_log=iter_log,
+        hard_fail_log=hard_fail_log,
+        soft_fail_log=soft_fail_log,
+        status_log=status_log,
+    )
 
-    axs[0].plot(path.s, speed_profile)
-    axs[0].set_title("Curvature-aware speed profile")
-    axs[0].set_xlabel("s [m]")
-    axs[0].set_ylabel("v_x [m/s]")
-    axs[0].grid(True)
-
-    axs[1].plot(t_log, ey_log)
-    axs[1].set_title("Cross-track error")
-    axs[1].set_xlabel("Time [s]")
-    axs[1].set_ylabel("e_y [m]")
-    axs[1].grid(True)
-
-    axs[2].plot(t_log, np.rad2deg(epsi_log))
-    axs[2].set_title("Heading error")
-    axs[2].set_xlabel("Time [s]")
-    axs[2].set_ylabel("e_psi [deg]")
-    axs[2].grid(True)
-
-    axs[3].plot(t_log, np.rad2deg(delta_log), label="delta")
-    axs[3].plot(t_log, np.rad2deg(ddelta_log), label="delta_dot")
-    axs[3].set_title("Steering states")
-    axs[3].set_xlabel("Time [s]")
-    axs[3].set_ylabel("[deg], [deg/s]")
-    axs[3].legend()
-    axs[3].grid(True)
-
-    axs[4].plot(t_log, vy_log, label="v_y")
-    axs[4].plot(t_log, r_log, label="r")
-    axs[4].set_title("Dynamic states")
-    axs[4].set_xlabel("Time [s]")
-    axs[4].set_ylabel("[m/s], [rad/s]")
-    axs[4].legend()
-    axs[4].grid(True)
-
-    axs[5].plot(t_log, vx_log, label="v_x")
-    axs[5].plot(t_log, s_log, label="s")
-    axs[5].set_title("Speed and path progress")
-    axs[5].set_xlabel("Time [s]")
-    axs[5].set_ylabel("v_x [m/s], s [m]")
-    axs[5].legend()
-    axs[5].grid(True)
-
-    if np.any(~np.isnan(solve_time_log)):
-        axs[6].plot(t_log, 1000.0 * solve_time_log, label="Solve time")
-    axs[6].set_title("NMPC solve time")
-    axs[6].set_xlabel("Time [s]")
-    axs[6].set_ylabel("Solve time [ms]")
-    axs[6].legend()
-    axs[6].grid(True)
-
-    axs[7].plot(t_log, soft_fail_log, drawstyle="steps-post", label="Soft warning")
-    axs[7].plot(t_log, hard_fail_log, drawstyle="steps-post", label="Hard failure")
-    axs[7].set_title("Solver warnings and failures")
-    axs[7].set_xlabel("Time [s]")
-    axs[7].set_ylabel("Flag [-]")
-    axs[7].set_ylim(-0.1, 1.1)
-    axs[7].legend()
-    axs[7].grid(True)
-
-    fig.tight_layout()
-    plt.show()
+    print("\n=== NMPC reference case completed ===")
+    print("Output directory: results_nmpc_reference_case")
+    print("\nLaTeX table row:")
+    print((Path("results_nmpc_reference_case") / "nmpc_reference_latex_row.txt").read_text().strip())
 
 
 if __name__ == "__main__":

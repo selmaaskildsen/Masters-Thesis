@@ -1,0 +1,4 @@
+NMPC reference & 0.00 & 0.00 & 0.00 & 0.01 & 0 & Yes \\
+Speed sensitivity & 0.01 & 0.00 & 0.01 & 0.53 & 5 & No/limited \\
+Tire-model mismatch & 0.00 & 0.00 & 0.01 & 0.01 & 0 & Yes \\
+Parameter sensitivity & 0.00 & 0.00 & 0.00 & 0.01 & 0 & Yes \\

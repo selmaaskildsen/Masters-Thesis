@@ -197,8 +197,8 @@ class NMPCPathFollowerNode(Node):
 
         # Recommended after first full-scale test: make NMPC steering demand less aggressive.
         # Comment these out if you want to use the defaults from nmpc_core.py instead.
-        self.ctrl_par.delta_max_deg = 25.0
-        self.ctrl_par.delta_rate_max_deg_s = 30.0
+        self.ctrl_par.delta_max_deg = 20.0
+        self.ctrl_par.delta_rate_max_deg_s = 25.0
         self.ctrl_par.q_delta = 2.0
         self.ctrl_par.r_ddelta = 20.0
         self.ctrl_par.r_ddelta_smooth = 50.0
