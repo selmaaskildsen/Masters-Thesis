@@ -1,1 +1,1 @@
-Linear MPC (OSQP) & Linear tire model & 0.178 & 1.010 & 2.72 & 22.50 & 0.48 & 0 \
+Linear MPC (OSQP) & Linear tire model & 0.188 & 1.013 & 2.59 & 18.00 & 0.18 & 0 \\

@@ -53,6 +53,12 @@ PLOT_CASES = {
     "Linear/Pacejka",
     "Dugoff/Pacejka",
 }
+CASE_COLORS = {
+    "Linear/Linear": "C0",
+    "Dugoff/Dugoff": "C1",
+    "Linear/Pacejka": "C2",
+    "Dugoff/Pacejka": "C3",
+}
 
 
 def make_constant_speed_profile(path: SplinePath, vx: float) -> np.ndarray:
@@ -537,7 +543,8 @@ def make_comparison_plots(results: list[tuple[dict, dict]], out_dir: Path) -> No
 
     for summary, logs in plot_results:
         label = summary["case_label"]
-        ax.plot(logs["x_log"], logs["y_log"], linewidth=1.9, label=label)
+        color = CASE_COLORS[label]
+        ax.plot(logs["x_log"], logs["y_log"], linewidth=1.9, label=label, color=color)
 
     ax.scatter([first_logs["x_log"][0]], [first_logs["y_log"][0]], marker="o", s=70, label="Start")
     ax.scatter([first_logs["path_x"][-1]], [first_logs["path_y"][-1]], marker="x", s=110, label="Goal")
@@ -577,12 +584,13 @@ def make_comparison_plots(results: list[tuple[dict, dict]], out_dir: Path) -> No
 
     for summary, logs in plot_results:
         label = summary["case_label"]
+        color = CASE_COLORS[label]
         s = logs["s_log"]
 
-        axs[0].plot(s, logs["ey_log"], linewidth=1.8, label=label)
-        axs[1].plot(s, np.rad2deg(logs["epsi_log"]), linewidth=1.8, label=label)
-        axs[2].plot(s, np.rad2deg(logs["delta_log"]), linewidth=1.8, label=label)
-        axs[3].plot(s, np.rad2deg(logs["ddelta_log"]), linewidth=1.8, label=label)
+        axs[0].plot(s, logs["ey_log"], linewidth=1.8, label=label, color=color)
+        axs[1].plot(s, np.rad2deg(logs["epsi_log"]), linewidth=1.8, label=label, color=color)
+        axs[2].plot(s, np.rad2deg(logs["delta_log"]), linewidth=1.8, label=label, color=color)
+        axs[3].plot(s, np.rad2deg(logs["ddelta_log"]), linewidth=1.8, label=label, color=color)
 
     axs[0].set_ylabel(r"$e_y$ [m]")
     axs[1].set_ylabel(r"$e_\psi$ [deg]")
@@ -606,12 +614,13 @@ def make_comparison_plots(results: list[tuple[dict, dict]], out_dir: Path) -> No
 
     for summary, logs in plot_results:
         label = summary["case_label"]
+        color = CASE_COLORS[label]
         s = logs["s_log"]
 
-        axs[0].plot(s, np.rad2deg(logs["alpha_f_log"]), linewidth=1.8, label=label)
-        axs[1].plot(s, np.rad2deg(logs["alpha_r_log"]), linewidth=1.8, label=label)
-        axs[2].plot(s, logs["Fyf_log"], linewidth=1.8, label=label)
-        axs[3].plot(s, logs["Fyr_log"], linewidth=1.8, label=label)
+        axs[0].plot(s, np.rad2deg(logs["alpha_f_log"]), linewidth=1.8, label=label, color=color)
+        axs[1].plot(s, np.rad2deg(logs["alpha_r_log"]), linewidth=1.8, label=label, color=color)
+        axs[2].plot(s, logs["Fyf_log"], linewidth=1.8, label=label, color=color)
+        axs[3].plot(s, logs["Fyr_log"], linewidth=1.8, label=label, color=color)
 
     axs[0].set_ylabel(r"$\alpha_f$ [deg]")
     axs[1].set_ylabel(r"$\alpha_r$ [deg]")
@@ -633,6 +642,7 @@ def make_comparison_plots(results: list[tuple[dict, dict]], out_dir: Path) -> No
 
     labels = [summary["case_label"] for summary, _ in results]
     x = np.arange(len(labels))
+    bar_colors = [CASE_COLORS[label] for label in labels]
 
     avg_solve_ms = np.array([summary["avg_solve_ms"] for summary, _ in results], dtype=float)
     max_solve_ms = np.array([summary["max_solve_ms"] for summary, _ in results], dtype=float)
@@ -649,7 +659,7 @@ def make_comparison_plots(results: list[tuple[dict, dict]], out_dir: Path) -> No
     axs[1].plot(x, max_iter, marker="o", linewidth=1.8, label="Max IPOPT iterations")
     axs[1].set_ylabel("Iterations [-]")
 
-    axs[2].bar(x, hard_failures, width=0.55, label="Hard failures")
+    axs[2].bar(x, hard_failures, width=0.55, label="Hard failures", color=bar_colors)
     axs[2].set_ylabel("Failures [-]")
 
     axs[3].bar(
@@ -657,6 +667,7 @@ def make_comparison_plots(results: list[tuple[dict, dict]], out_dir: Path) -> No
         np.array([summary["soft_warnings"] for summary, _ in results], dtype=float),
         width=0.55,
         label="Soft warnings",
+        color=bar_colors
     )
     axs[3].set_ylabel("Warnings [-]")
 

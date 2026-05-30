@@ -1,31 +1,26 @@
 """
-linear_mpc_curvature_stress_result.py
+linear_mpc_baseline_result.py
 
-Curvature-stress simulation for the results chapter:
-- Same controller and plant setup as the linear MPC baseline
+Baseline simulation for the results chapter:
 - Linear MPC with curvature preview
 - Dynamic bicycle error-state model: x = [e_y, e_psi, v_y, r, delta]
 - Control input: u = delta_dot
 - Linear tire model in both controller and plant
-- Compares mild and sharp reference paths at the same nominal speed
-- Saves comparison plots, logs, CSV metrics, and LaTeX table rows
+- Mild reference path, moderate constant speed, nominal vehicle parameters
+- Saves plots, logs, CSV metrics, and a LaTeX table row for Section 4.3
 
 Run:
-    python linear_mpc_curvature_stress_result.py
+    python linear_mpc_baseline_result.py
 
 Outputs:
-    results_curvature_stress_linear_mpc/
-        mild_trajectory_linear_mpc.png
-        mild_errors_steering_linear_mpc.png
-        mild_dynamic_response_linear_mpc.png
-        mild_solver_performance_linear_mpc.png
-        sharp_trajectory_linear_mpc.png
-        sharp_errors_steering_linear_mpc.png
-        sharp_dynamic_response_linear_mpc.png
-        sharp_solver_performance_linear_mpc.png
-        curvature_metrics.csv
-        curvature_latex_rows.txt
-        curvature_logs.npz
+    results_linear_mpc_baseline/
+        baseline_trajectory_linear_mpc.png
+        baseline_errors_steering_linear_mpc.png
+        baseline_dynamic_response_linear_mpc.png
+        baseline_solver_performance_linear_mpc.png
+        baseline_metrics.csv
+        baseline_latex_row.txt
+        baseline_logs.npz
 """
 
 from __future__ import annotations
@@ -40,9 +35,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import osqp
 import scipy.sparse as sp
+from scipy.signal import savgol_filter
 from scipy.interpolate import CubicSpline
 from scipy.linalg import expm
-from scipy.signal import savgol_filter
 
 
 # ============================================================
@@ -120,10 +115,12 @@ def smooth_signal(y: np.ndarray, window: int = 101, polyorder: int = 3) -> np.nd
         return y.copy()
 
     window = int(window)
+
     if window % 2 == 0:
         window += 1
 
     window = min(window, len(y))
+
     if window % 2 == 0:
         window -= 1
 
@@ -132,7 +129,7 @@ def smooth_signal(y: np.ndarray, window: int = 101, polyorder: int = 3) -> np.nd
         if window % 2 == 0:
             window += 1
 
-    if window > len(y) or window <= polyorder:
+    if window > len(y):
         return y.copy()
 
     return savgol_filter(y, window_length=window, polyorder=polyorder, mode="interp")
@@ -148,7 +145,7 @@ class SplinePath:
     sx: CubicSpline
     sy: CubicSpline
     s_max: float
-
+    
     @staticmethod
     def from_waypoints(xy: np.ndarray) -> "SplinePath":
         dx = np.diff(xy[:, 0])
@@ -416,15 +413,15 @@ def continuous_matrices(
 
 @dataclass
 class MPCConfig:
-    Ts: float = 0.1
-    horizon_s: float = 1.8
-    w_ey: float = 80.0
-    w_epsi: float = 50.0
-    w_vy: float = 5.0
-    w_r: float = 3.0
-    w_delta: float = 0.8
-    w_udot: float = 3.0
-    terminal_mult: float = 2.0
+    Ts: float = 0.05
+    horizon_s: float = 2.5
+    w_ey: float = 40.0
+    w_epsi: float = 20.0
+    w_vy: float = 0.5
+    w_r: float = 2.0
+    w_delta: float = 0.5
+    w_udot: float = 0.2
+    terminal_mult: float = 10.0
 
     @property
     def N(self) -> int:
@@ -528,6 +525,7 @@ class OSQPMPC:
                 cols.append(cuk)
                 data.append(-self.Bd[i, 0])
 
+        # Steering angle bounds through state delta.
         for k in range(self.N):
             r = self.neq + k
             cxk = self._idx_x(k)
@@ -535,6 +533,7 @@ class OSQPMPC:
             cols.append(cxk + 4)
             data.append(1.0)
 
+        # Steering-rate bounds through input delta_dot.
         for k in range(self.N):
             r = self.neq + self.N + k
             cuk = self._idx_u(k)
@@ -602,12 +601,15 @@ class OSQPMPC:
 
 
 # ============================================================
-# Scenario setup
+# Baseline scenario setup
 # ============================================================
 
 def build_mild_waypoints() -> np.ndarray:
     """
     Smooth mild path used as the nominal baseline reference path.
+
+    The path is defined analytically and sampled densely before spline fitting.
+    This gives a smoother curvature profile than using only a few sparse waypoints.
     """
     x = np.linspace(0.0, 90.0, 60)
     y = 4.5 * (1.0 - np.cos(np.pi * x / 90.0))
@@ -615,27 +617,20 @@ def build_mild_waypoints() -> np.ndarray:
     return np.column_stack([x, y])
 
 
-def build_sharp_waypoints() -> np.ndarray:
-    """
-    Sharper path used for the curvature stress scenario.
-    """
-    x = np.array([0, 10, 20, 30, 40, 50, 55, 60, 65, 75, 90, 110], dtype=float)
-    y = np.array([0,  0,  0,  2,  8, 18, 28, 35, 38, 36, 30, 25], dtype=float)
-
-    return np.column_stack([x, y])
-
-
 @dataclass
-class ScenarioConfig:
-    name: str
-    path_name: str
+class BaselineConfig:
+    name: str = "linear_mpc_baseline_mild_7ms"
     vx: float = 7.0
+
+    # Use a small initial offset to show transient convergence.
     initial_cross_track_error: float = 1.0
     initial_heading_error_deg: float = 2.0
+
     sim_time: float = 50.0
     goal_radius: float = 2.0
     s_end_margin: float = 3.0
-    output_dir: str = "results_curvature_stress_linear_mpc"
+
+    output_dir: str = "results_linear_mpc_baseline"
     show_plots: bool = False
 
 
@@ -643,20 +638,14 @@ class ScenarioConfig:
 # Simulation and result export
 # ============================================================
 
-def run_case(cfg: ScenarioConfig) -> tuple[dict, dict]:
+def run_baseline(cfg: BaselineConfig) -> dict:
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     p = VehicleParams()
-    mcfg = MPCConfig(Ts=0.1, horizon_s=1.8)
+    mcfg = MPCConfig(Ts=0.05, horizon_s=2.5)
 
-    if cfg.path_name == "mild":
-        waypoints = build_mild_waypoints()
-    elif cfg.path_name == "sharp":
-        waypoints = build_sharp_waypoints()
-    else:
-        raise ValueError(f"Unknown path_name: {cfg.path_name}")
-
+    waypoints = build_mild_waypoints()
     path = SplinePath.from_waypoints(waypoints)
 
     vx = cfg.vx
@@ -666,6 +655,7 @@ def run_case(cfg: ScenarioConfig) -> tuple[dict, dict]:
 
     mpc = OSQPMPC(Ad, Bd, Ed, p, mcfg)
 
+    # Initial condition: offset from the path, expressed in global coordinates.
     x0_ref, y0_ref = path.eval_xy(0.0)
     psi0_ref = path.heading(0.0)
 
@@ -755,6 +745,7 @@ def run_case(cfg: ScenarioConfig) -> tuple[dict, dict]:
             stopped_on_goal = True
             break
 
+    # Trim logs.
     T = T[: last_valid_idx + 1]
     Xg = Xg[: last_valid_idx + 1, :]
     Xe = Xe[: last_valid_idx + 1, :]
@@ -776,13 +767,18 @@ def run_case(cfg: ScenarioConfig) -> tuple[dict, dict]:
     valid_solve = solve_time[~np.isnan(solve_time)]
     valid_iter = osqp_iter[~np.isnan(osqp_iter)]
 
-    s_plot = np.linspace(0.0, path.s_max, 1600)
+    # Reference path and curvature data.
+    s_plot = np.linspace(0.0, path.s_max, 1200)
     x_ref = path.sx(s_plot)
     y_ref = path.sy(s_plot)
 
     kappa_ref_raw = np.array([path.curvature(sv) for sv in s_plot])
+
+    # Stronger smoothing for visualization only.
     kappa_ref_plot = smooth_signal(kappa_ref_raw, window=151, polyorder=3)
 
+    # Use logged path progress s(t), not raw projected curvature K.
+    # This avoids small projection-induced jumps in the curvature time series.
     kappa_time_plot = np.interp(Slog, s_plot, kappa_ref_plot)
     r_ref_plot = vx_log * kappa_time_plot
 
@@ -790,7 +786,7 @@ def run_case(cfg: ScenarioConfig) -> tuple[dict, dict]:
         "scenario": cfg.name,
         "controller": "Linear MPC (OSQP)",
         "plant": "Linear tire model",
-        "path": cfg.path_name,
+        "path": "mild",
         "vx_nominal_m_s": vx,
         "initial_cross_track_error_m": cfg.initial_cross_track_error,
         "initial_heading_error_deg": cfg.initial_heading_error_deg,
@@ -820,80 +816,52 @@ def run_case(cfg: ScenarioConfig) -> tuple[dict, dict]:
         "final_distance_to_goal_m": float(np.hypot(Xg[-1, 0] - goal_x, Xg[-1, 1] - goal_y)),
     }
 
-    logs = {
-        "T": T,
-        "Xg": Xg,
-        "Xe": Xe,
-        "U": U,
-        "K": K,
-        "K_plot": kappa_time_plot,
-        "Rref": Rref,
-        "Rref_plot": r_ref_plot,
-        "Slog": Slog,
-        "solve_time": solve_time,
-        "osqp_iter": osqp_iter,
-        "solve_fail": solve_fail,
-        "s_plot": s_plot,
-        "x_ref": x_ref,
-        "y_ref": y_ref,
-        "kappa_ref": kappa_ref_raw,
-        "kappa_ref_plot": kappa_ref_plot,
-        "waypoints": waypoints,
-    }
+    # ============================================================
+    # Save logs and metrics
+    # ============================================================
 
-    return metrics, logs
+    np.savez(
+        out_dir / "baseline_logs.npz",
+        T=T,
+        Slog=Slog,
+        Xg=Xg,
+        Xe=Xe,
+        U=U,
+        K=K,
+        K_plot=kappa_time_plot,
+        Rref=Rref,
+        Rref_plot=r_ref_plot,
+        solve_time=solve_time,
+        osqp_iter=osqp_iter,
+        solve_fail=solve_fail,
+        s_plot=s_plot,
+        x_ref=x_ref,
+        y_ref=y_ref,
+        kappa_ref=kappa_ref_raw,
+        kappa_ref_plot=kappa_ref_plot,
+    )
 
-
-def save_metrics(results: list[tuple[ScenarioConfig, dict, dict]], out_dir: Path) -> None:
-    metric_rows = [m for _, m, _ in results]
-
-    csv_path = out_dir / "curvature_metrics.csv"
+    csv_path = out_dir / "baseline_metrics.csv"
     with csv_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(metric_rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=list(metrics.keys()))
         writer.writeheader()
-        writer.writerows(metric_rows)
+        writer.writerow(metrics)
 
-    lines = []
-    for _, metrics, _ in results:
-        line = (
-            f"{metrics['path']} & "
-            f"{metrics['max_abs_kappa_1_m']:.4f} & "
-            f"{metrics['rms_ey_m']:.3f} & "
-            f"{metrics['max_abs_ey_m']:.3f} & "
-            f"{metrics['rms_epsi_deg']:.2f} & "
-            f"{metrics['max_abs_delta_deg']:.2f} & "
-            f"{metrics['max_abs_ddelta_deg_s']:.2f} & "
-            f"{metrics['mean_solve_ms']:.2f} & "
-            f"{metrics['hard_failures']} \\\\"
-        )
-        lines.append(line)
+    latex_row = (
+        "Linear MPC (OSQP) & Linear tire model & "
+        f"{metrics['rms_ey_m']:.3f} & "
+        f"{metrics['max_abs_ey_m']:.3f} & "
+        f"{metrics['rms_epsi_deg']:.2f} & "
+        f"{metrics['max_abs_delta_deg']:.2f} & "
+        f"{metrics['mean_solve_ms']:.2f} & "
+        f"{metrics['hard_failures']} \\\\"
+    )
+    (out_dir / "baseline_latex_row.txt").write_text(latex_row + "\n")
 
-    (out_dir / "curvature_latex_rows.txt").write_text("\n".join(lines) + "\n")
+    # ============================================================
+    # Plot settings
+    # ============================================================
 
-
-def save_npz_logs(results: list[tuple[ScenarioConfig, dict, dict]], out_dir: Path) -> None:
-    npz_data = {}
-    for cfg, metrics, logs in results:
-        prefix = cfg.path_name
-        for key, value in logs.items():
-            npz_data[f"{prefix}_{key}"] = value
-        for key, value in metrics.items():
-            if isinstance(value, (int, float, bool, np.number)):
-                npz_data[f"{prefix}_metric_{key}"] = value
-
-    np.savez(out_dir / "curvature_logs.npz", **npz_data)
-
-
-def make_case_plots(results: list[tuple[ScenarioConfig, dict, dict]], out_dir: Path) -> None:
-    """
-    Make one set of baseline-style plots for each curvature scenario.
-
-    The plot layout intentionally matches the baseline test:
-    1. trajectory
-    2. tracking errors and steering response
-    3. dynamic response
-    4. solver performance
-    """
     plt.rcParams.update(
         {
             "font.size": 11,
@@ -905,187 +873,146 @@ def make_case_plots(results: list[tuple[ScenarioConfig, dict, dict]], out_dir: P
         }
     )
 
-    for cfg, metrics, logs in results:
-        label = cfg.path_name
-        title_label = cfg.path_name.capitalize()
+	# ============================================================
+	# Plot 1: trajectory
+	# ============================================================
+	fig, ax = plt.subplots(figsize=(9.0, 5.5))
 
-        T = logs["T"]
-        Xg = logs["Xg"]
-        Xe = logs["Xe"]
-        U = logs["U"]
-        kappa_time_plot = logs["K_plot"]
-        r_ref_plot = logs["Rref_plot"]
-        solve_time = logs["solve_time"]
-        osqp_iter = logs["osqp_iter"]
+	ax.plot(x_ref, y_ref, "--", linewidth=2.2, label="Reference path")
+	ax.plot(Xg[:, 0], Xg[:, 1], linewidth=2.0, label="Vehicle trajectory")
+	ax.scatter([Xg[0, 0]], [Xg[0, 1]], marker="o", s=55, label="Start")
+	ax.scatter([goal_x], [goal_y], marker="x", s=90, label="Goal")
 
-        ey = Xe[:, 0]
-        epsi = Xe[:, 1]
-        delta = Xe[:, 4]
-        ddelta = U
-        r = Xg[:, 5]
-        vx_log = Xg[:, 3]
+	# Add margins so the trajectory is not visually clipped.
+	x_all = np.concatenate([x_ref, Xg[:, 0]])
+	y_all = np.concatenate([y_ref, Xg[:, 1]])
 
-        x_ref = logs["x_ref"]
-        y_ref = logs["y_ref"]
-        goal_x = logs["waypoints"][-1, 0]
-        goal_y = logs["waypoints"][-1, 1]
+	x_margin = 0.05 * (np.max(x_all) - np.min(x_all))
+	y_margin = 0.30 * max(1.0, np.max(y_all) - np.min(y_all))
 
-        # ========================================================
-        # Plot 1: trajectory
-        # ========================================================
+	ax.set_xlim(np.min(x_all) - x_margin, np.max(x_all) + x_margin)
+	ax.set_ylim(np.min(y_all) - y_margin, np.max(y_all) + y_margin)
 
-        fig, ax = plt.subplots(figsize=(10.5, 6.8))
+	# Keep equal scaling, but with larger y-margin.
+	ax.set_aspect("equal", adjustable="box")
 
-        ax.plot(x_ref, y_ref, "--", linewidth=2.4, label="Reference path")
-        ax.plot(Xg[:, 0], Xg[:, 1], linewidth=2.2, label="Vehicle trajectory")
-        ax.scatter([Xg[0, 0]], [Xg[0, 1]], marker="o", s=70, label="Start")
-        ax.scatter([goal_x], [goal_y], marker="x", s=110, label="Goal")
+	ax.grid(True)
+	ax.set_xlabel("x [m]")
+	ax.set_ylabel("y [m]")
+	ax.set_title("Baseline trajectory: Linear MPC with linear tire model")
+	ax.legend(loc="upper right")
 
-        x_all = np.concatenate([x_ref, Xg[:, 0]])
-        y_all = np.concatenate([y_ref, Xg[:, 1]])
+	fig.tight_layout()
+	fig.savefig(out_dir / "baseline_trajectory_linear_mpc.png", dpi=300)
 
-        x_range = np.max(x_all) - np.min(x_all)
-        y_range = np.max(y_all) - np.min(y_all)
+    # ============================================================
+    # Plot 2: tracking errors and steering response
+    # ============================================================
 
-        x_margin = 0.04 * max(1.0, x_range)
-        y_margin = 0.80 * max(1.0, y_range)
+    fig, axs = plt.subplots(4, 1, figsize=(8.5, 9.5), sharex=True)
 
-        ax.set_xlim(np.min(x_all) - x_margin, np.max(x_all) + x_margin)
-        ax.set_ylim(np.min(y_all) - y_margin, np.max(y_all) + y_margin)
+    axs[0].plot(T, ey, linewidth=1.8)
+    axs[0].set_ylabel(r"$e_y$ [m]")
+    axs[0].grid(True)
 
-        # Do not force equal aspect. The paths are long relative to lateral variation.
-        ax.set_aspect("auto")
+    axs[1].plot(T, np.rad2deg(epsi), linewidth=1.8)
+    axs[1].set_ylabel(r"$e_\psi$ [deg]")
+    axs[1].grid(True)
 
-        ax.grid(True)
-        ax.set_xlabel("x [m]")
-        ax.set_ylabel("y [m]")
-        ax.set_title(f"{title_label} path trajectory: Linear MPC with linear tire model")
-        ax.legend(loc="best")
+    axs[2].plot(T, np.rad2deg(delta), linewidth=1.8)
+    axs[2].set_ylabel(r"$\delta$ [deg]")
+    axs[2].grid(True)
 
-        fig.tight_layout()
-        fig.savefig(out_dir / f"{label}_trajectory_linear_mpc.png", dpi=300)
+    axs[3].plot(T, np.rad2deg(ddelta), linewidth=1.8)
+    axs[3].set_ylabel(r"$\dot{\delta}$ [deg/s]")
+    axs[3].set_xlabel("Time [s]")
+    axs[3].grid(True)
 
-        # ========================================================
-        # Plot 2: tracking errors and steering response
-        # ========================================================
+    fig.suptitle("Baseline tracking errors and steering response")
+    fig.tight_layout()
+    fig.savefig(out_dir / "baseline_errors_steering_linear_mpc.png", dpi=300)
 
-        fig, axs = plt.subplots(4, 1, figsize=(8.5, 9.5), sharex=True)
+	# ============================================================
+	# Plot 3: dynamic response
+	# ============================================================
 
-        axs[0].plot(T, ey, linewidth=1.8)
-        axs[0].set_ylabel(r"$e_y$ [m]")
-        axs[0].grid(True)
+	fig, axs = plt.subplots(3, 1, figsize=(8.5, 7.2), sharex=True)
 
-        axs[1].plot(T, np.rad2deg(epsi), linewidth=1.8)
-        axs[1].set_ylabel(r"$e_\psi$ [deg]")
-        axs[1].grid(True)
+	axs[0].plot(T, kappa_time_plot, linewidth=1.8, label=r"Smoothed $\kappa$")
+	axs[0].set_ylabel(r"$\kappa$ [1/m]")
+	axs[0].grid(True)
+	axs[0].legend(loc="best")
 
-        axs[2].plot(T, np.rad2deg(delta), linewidth=1.8)
-        axs[2].set_ylabel(r"$\delta$ [deg]")
-        axs[2].grid(True)
+	axs[1].plot(T, vx_log, linewidth=1.8)
+	axs[1].set_ylabel(r"$v_x$ [m/s]")
+	axs[1].grid(True)
 
-        axs[3].plot(T, np.rad2deg(ddelta), linewidth=1.8)
-        axs[3].set_ylabel(r"$\dot{\delta}$ [deg/s]")
-        axs[3].set_xlabel("Time [s]")
-        axs[3].grid(True)
+	axs[2].plot(T, r, linewidth=1.8, label=r"$r$")
+	axs[2].plot(T, r_ref_plot, "--", linewidth=1.8, label=r"$v_x \kappa$")
+	axs[2].set_ylabel("Yaw rate [rad/s]")
+	axs[2].set_xlabel("Time [s]")
+	axs[2].grid(True)
+	axs[2].legend(loc="best")
 
-        fig.suptitle(f"{title_label} path tracking errors and steering response")
-        fig.tight_layout()
-        fig.savefig(out_dir / f"{label}_errors_steering_linear_mpc.png", dpi=300)
+	fig.suptitle("Baseline dynamic response")
+	fig.tight_layout()
+	fig.savefig(out_dir / "baseline_dynamic_response_linear_mpc.png", dpi=300)
 
-        # ========================================================
-        # Plot 3: dynamic response
-        # ========================================================
+    # ============================================================
+    # Plot 4: solver performance
+    # ============================================================
 
-        fig, axs = plt.subplots(3, 1, figsize=(8.5, 7.2), sharex=True)
+    fig, axs = plt.subplots(2, 1, figsize=(8.5, 5.8), sharex=True)
 
-        axs[0].plot(T, kappa_time_plot, linewidth=1.8, label=r"Smoothed $\kappa$")
-        axs[0].set_ylabel(r"$\kappa$ [1/m]")
-        axs[0].grid(True)
-        axs[0].legend(loc="best")
+    axs[0].plot(T, 1000.0 * solve_time, linewidth=1.8, label="OSQP solve time")
+    axs[0].axhline(
+        1000.0 * mcfg.Ts,
+        linestyle="--",
+        linewidth=1.5,
+        label="Control period",
+    )
+    axs[0].set_ylabel("Solve time [ms]")
+    axs[0].grid(True)
+    axs[0].legend(loc="best")
 
-        axs[1].plot(T, vx_log, linewidth=1.8)
-        axs[1].set_ylabel(r"$v_x$ [m/s]")
-        axs[1].grid(True)
+    axs[1].step(T, osqp_iter, where="post", linewidth=1.8)
+    axs[1].set_ylabel("OSQP iterations")
+    axs[1].set_xlabel("Time [s]")
+    axs[1].grid(True)
 
-        axs[2].plot(T, r, linewidth=1.8, label=r"$r$")
-        axs[2].plot(T, r_ref_plot, "--", linewidth=1.8, label=r"$v_x \kappa$")
-        axs[2].set_ylabel("Yaw rate [rad/s]")
-        axs[2].set_xlabel("Time [s]")
-        axs[2].grid(True)
-        axs[2].legend(loc="best")
+    fig.suptitle("Baseline solver performance")
+    fig.tight_layout()
+    fig.savefig(out_dir / "baseline_solver_performance_linear_mpc.png", dpi=300)
 
-        fig.suptitle(f"{title_label} path dynamic response")
-        fig.tight_layout()
-        fig.savefig(out_dir / f"{label}_dynamic_response_linear_mpc.png", dpi=300)
+    if cfg.show_plots:
+        plt.show()
+    else:
+        plt.close("all")
 
-        # ========================================================
-        # Plot 4: solver performance
-        # ========================================================
-
-        fig, axs = plt.subplots(2, 1, figsize=(8.5, 5.8), sharex=True)
-
-        axs[0].plot(T, 1000.0 * solve_time, linewidth=1.8, label="OSQP solve time")
-        axs[0].axhline(100.0, linestyle="--", linewidth=1.5, label="Control period")
-        axs[0].set_ylabel("Solve time [ms]")
-        axs[0].grid(True)
-        axs[0].legend(loc="best")
-
-        axs[1].step(T, osqp_iter, where="post", linewidth=1.8)
-        axs[1].set_ylabel("OSQP iterations")
-        axs[1].set_xlabel("Time [s]")
-        axs[1].grid(True)
-
-        fig.suptitle(f"{title_label} path solver performance")
-        fig.tight_layout()
-        fig.savefig(out_dir / f"{label}_solver_performance_linear_mpc.png", dpi=300)
-
-    plt.close("all")
-
+    return metrics
 
 
 def main() -> None:
-    out_dir = Path("results_curvature_stress_linear_mpc")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = BaselineConfig()
+    metrics = run_baseline(cfg)
 
-    cases = [
-        ScenarioConfig(
-            name="linear_mpc_mild_path_7ms",
-            path_name="mild",
-            output_dir=str(out_dir),
-        ),
-        ScenarioConfig(
-            name="linear_mpc_sharp_path_7ms",
-            path_name="sharp",
-            output_dir=str(out_dir),
-        ),
-    ]
+    print("\n=== Linear MPC baseline completed ===")
+    print(f"Output directory: {cfg.output_dir}")
+    print(f"Initial e_y:      {metrics['initial_cross_track_error_m']:.2f} m")
+    print(f"Initial e_psi:    {metrics['initial_heading_error_deg']:.2f} deg")
+    print(f"RMS e_y:          {metrics['rms_ey_m']:.3f} m")
+    print(f"Max |e_y|:        {metrics['max_abs_ey_m']:.3f} m")
+    print(f"RMS e_psi:        {metrics['rms_epsi_deg']:.2f} deg")
+    print(f"Max |delta|:      {metrics['max_abs_delta_deg']:.2f} deg")
+    print(f"Mean solve time:  {metrics['mean_solve_ms']:.2f} ms")
+    print(f"Max solve time:   {metrics['max_solve_ms']:.2f} ms")
+    print(f"Mean OSQP iter:   {metrics['mean_osqp_iter']:.1f}")
+    print(f"Max OSQP iter:    {metrics['max_osqp_iter']:.0f}")
+    print(f"Hard failures:    {metrics['hard_failures']}")
+    print(f"Stopped on goal:  {metrics['stopped_on_goal']}")
 
-    results = []
-    for cfg in cases:
-        print(f"\n=== Running {cfg.name} ===")
-        metrics, logs = run_case(cfg)
-        results.append((cfg, metrics, logs))
-
-        print(f"Path:             {metrics['path']}")
-        print(f"Max |kappa|:      {metrics['max_abs_kappa_1_m']:.4f} 1/m")
-        print(f"RMS e_y:          {metrics['rms_ey_m']:.3f} m")
-        print(f"Max |e_y|:        {metrics['max_abs_ey_m']:.3f} m")
-        print(f"RMS e_psi:        {metrics['rms_epsi_deg']:.2f} deg")
-        print(f"Max |delta|:      {metrics['max_abs_delta_deg']:.2f} deg")
-        print(f"Max |delta_dot|:  {metrics['max_abs_ddelta_deg_s']:.2f} deg/s")
-        print(f"Mean solve time:  {metrics['mean_solve_ms']:.2f} ms")
-        print(f"Max solve time:   {metrics['max_solve_ms']:.2f} ms")
-        print(f"Hard failures:    {metrics['hard_failures']}")
-        print(f"Stopped on goal:  {metrics['stopped_on_goal']}")
-
-    save_metrics(results, out_dir)
-    save_npz_logs(results, out_dir)
-    make_case_plots(results, out_dir)
-
-    print("\n=== Curvature stress scenario completed ===")
-    print(f"Output directory: {out_dir}")
-    print("\nLaTeX rows:")
-    print((out_dir / "curvature_latex_rows.txt").read_text().strip())
+    print("\nLaTeX table row:")
+    print((Path(cfg.output_dir) / "baseline_latex_row.txt").read_text().strip())
 
 
 if __name__ == "__main__":

@@ -413,15 +413,15 @@ def continuous_matrices(
 
 @dataclass
 class MPCConfig:
-    Ts: float = 0.05
-    horizon_s: float = 2.5
-    w_ey: float = 40.0
-    w_epsi: float = 20.0
-    w_vy: float = 0.5
-    w_r: float = 2.0
-    w_delta: float = 0.5
-    w_udot: float = 0.2
-    terminal_mult: float = 10.0
+    Ts: float = 0.1
+    horizon_s: float = 1.8
+    w_ey: float = 80.0
+    w_epsi: float = 50.0
+    w_vy: float = 5.0
+    w_r: float = 3.0
+    w_delta: float = 0.8
+    w_udot: float = 3.0
+    terminal_mult: float = 2.0
 
     @property
     def N(self) -> int:
@@ -643,7 +643,7 @@ def run_baseline(cfg: BaselineConfig) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     p = VehicleParams()
-    mcfg = MPCConfig(Ts=0.05, horizon_s=2.5)
+    mcfg = MPCConfig()
 
     waypoints = build_mild_waypoints()
     path = SplinePath.from_waypoints(waypoints)
@@ -783,7 +783,7 @@ def run_baseline(cfg: BaselineConfig) -> dict:
     r_ref_plot = vx_log * kappa_time_plot
 
     metrics = {
-        "scenario": cfg.name,
+        "scenario": cfg.name + "_matched",
         "controller": "Linear MPC (OSQP)",
         "plant": "Linear tire model",
         "path": "mild",
@@ -873,37 +873,37 @@ def run_baseline(cfg: BaselineConfig) -> dict:
         }
     )
 
-	# ============================================================
-	# Plot 1: trajectory
-	# ============================================================
-	fig, ax = plt.subplots(figsize=(9.0, 5.5))
+    # ============================================================
+    # Plot 1: trajectory
+    # ============================================================
+    fig, ax = plt.subplots(figsize=(9.0, 5.5))
 
-	ax.plot(x_ref, y_ref, "--", linewidth=2.2, label="Reference path")
-	ax.plot(Xg[:, 0], Xg[:, 1], linewidth=2.0, label="Vehicle trajectory")
-	ax.scatter([Xg[0, 0]], [Xg[0, 1]], marker="o", s=55, label="Start")
-	ax.scatter([goal_x], [goal_y], marker="x", s=90, label="Goal")
+    ax.plot(x_ref, y_ref, "--", linewidth=2.2, label="Reference path")
+    ax.plot(Xg[:, 0], Xg[:, 1], linewidth=2.0, label="Vehicle trajectory")
+    ax.scatter([Xg[0, 0]], [Xg[0, 1]], marker="o", s=55, label="Start")
+    ax.scatter([goal_x], [goal_y], marker="x", s=90, label="Goal")
 
-	# Add margins so the trajectory is not visually clipped.
-	x_all = np.concatenate([x_ref, Xg[:, 0]])
-	y_all = np.concatenate([y_ref, Xg[:, 1]])
+    # Add margins so the trajectory is not visually clipped.
+    x_all = np.concatenate([x_ref, Xg[:, 0]])
+    y_all = np.concatenate([y_ref, Xg[:, 1]])
 
-	x_margin = 0.05 * (np.max(x_all) - np.min(x_all))
-	y_margin = 0.30 * max(1.0, np.max(y_all) - np.min(y_all))
+    x_margin = 0.05 * (np.max(x_all) - np.min(x_all))
+    y_margin = 0.30 * max(1.0, np.max(y_all) - np.min(y_all))
 
-	ax.set_xlim(np.min(x_all) - x_margin, np.max(x_all) + x_margin)
-	ax.set_ylim(np.min(y_all) - y_margin, np.max(y_all) + y_margin)
+    ax.set_xlim(np.min(x_all) - x_margin, np.max(x_all) + x_margin)
+    ax.set_ylim(np.min(y_all) - y_margin, np.max(y_all) + y_margin)
 
-	# Keep equal scaling, but with larger y-margin.
-	ax.set_aspect("equal", adjustable="box")
+    # Keep equal scaling, but with larger y-margin.
+    ax.set_aspect("equal", adjustable="box")
 
-	ax.grid(True)
-	ax.set_xlabel("x [m]")
-	ax.set_ylabel("y [m]")
-	ax.set_title("Baseline trajectory: Linear MPC with linear tire model")
-	ax.legend(loc="upper right")
+    ax.grid(True)
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_title("Baseline trajectory: Linear MPC with linear tire model")
+    ax.legend(loc="upper right")
 
-	fig.tight_layout()
-	fig.savefig(out_dir / "baseline_trajectory_linear_mpc.png", dpi=300)
+    fig.tight_layout()
+    fig.savefig(out_dir / "baseline_trajectory_linear_mpc.png", dpi=300)
 
     # ============================================================
     # Plot 2: tracking errors and steering response
@@ -932,31 +932,31 @@ def run_baseline(cfg: BaselineConfig) -> dict:
     fig.tight_layout()
     fig.savefig(out_dir / "baseline_errors_steering_linear_mpc.png", dpi=300)
 
-	# ============================================================
-	# Plot 3: dynamic response
-	# ============================================================
+    # ============================================================
+    # Plot 3: dynamic response
+    # ============================================================
 
-	fig, axs = plt.subplots(3, 1, figsize=(8.5, 7.2), sharex=True)
+    fig, axs = plt.subplots(3, 1, figsize=(8.5, 7.2), sharex=True)
 
-	axs[0].plot(T, kappa_time_plot, linewidth=1.8, label=r"Smoothed $\kappa$")
-	axs[0].set_ylabel(r"$\kappa$ [1/m]")
-	axs[0].grid(True)
-	axs[0].legend(loc="best")
+    axs[0].plot(T, kappa_time_plot, linewidth=1.8, label=r"Smoothed $\kappa$")
+    axs[0].set_ylabel(r"$\kappa$ [1/m]")
+    axs[0].grid(True)
+    axs[0].legend(loc="best")
 
-	axs[1].plot(T, vx_log, linewidth=1.8)
-	axs[1].set_ylabel(r"$v_x$ [m/s]")
-	axs[1].grid(True)
+    axs[1].plot(T, vx_log, linewidth=1.8)
+    axs[1].set_ylabel(r"$v_x$ [m/s]")
+    axs[1].grid(True)
 
-	axs[2].plot(T, r, linewidth=1.8, label=r"$r$")
-	axs[2].plot(T, r_ref_plot, "--", linewidth=1.8, label=r"$v_x \kappa$")
-	axs[2].set_ylabel("Yaw rate [rad/s]")
-	axs[2].set_xlabel("Time [s]")
-	axs[2].grid(True)
-	axs[2].legend(loc="best")
+    axs[2].plot(T, r, linewidth=1.8, label=r"$r$")
+    axs[2].plot(T, r_ref_plot, "--", linewidth=1.8, label=r"$v_x \kappa$")
+    axs[2].set_ylabel("Yaw rate [rad/s]")
+    axs[2].set_xlabel("Time [s]")
+    axs[2].grid(True)
+    axs[2].legend(loc="best")
 
-	fig.suptitle("Baseline dynamic response")
-	fig.tight_layout()
-	fig.savefig(out_dir / "baseline_dynamic_response_linear_mpc.png", dpi=300)
+    fig.suptitle("Baseline dynamic response")
+    fig.tight_layout()
+    fig.savefig(out_dir / "baseline_dynamic_response_linear_mpc.png", dpi=300)
 
     # ============================================================
     # Plot 4: solver performance
